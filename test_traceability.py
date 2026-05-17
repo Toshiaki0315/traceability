@@ -191,5 +191,101 @@ class TestPBFTSimulation(unittest.TestCase):
         self.assertEqual(hash1, hash2)
         self.assertEqual(hash2, hash3)
 
+class TestByzantineFaultTolerance(unittest.TestCase):
+    """ステップ5: ビザンチン障害耐性テスト"""
+
+    def _create_network(self, node_count=3):
+        """テスト用のフルメッシュP2Pネットワークを構築するヘルパー"""
+        from traceability import Node, sign_data, generate_keypair
+        roles = ["Leader"] + ["Replica"] * (node_count - 1)
+        nodes = [Node(f"Node{i+1}", roles[i]) for i in range(node_count)]
+        for n1 in nodes:
+            for n2 in nodes:
+                if n1 != n2:
+                    n1.add_peer(n2)
+        return nodes
+
+    def _inject_transaction(self, nodes):
+        """全ノードにテスト用トランザクションを注入するヘルパー"""
+        from traceability import sign_data, generate_keypair
+        pub, priv = generate_keypair()
+        test_data = {"test": "BFT"}
+        payload = {"data": test_data, "signature": sign_data(test_data, priv), "public_key": pub}
+        for node in nodes:
+            node.receive_message("NEW_TRANSACTION", payload, "ExternalSender")
+        return payload
+
+    def test_malicious_node_rejected(self):
+        """不正なブロック（ハッシュ改ざん）を送信するノードがいても、他ノードが拒否すること"""
+        from traceability import Node, Block
+        nodes = self._create_network(3)
+        self._inject_transaction(nodes)
+
+        leader = nodes[0]
+        # リーダーが正規のブロック候補を作成（ブロードキャストはしない）
+        transactions = leader.pending_transactions.copy()
+        leader.pending_transactions.clear()
+        latest = leader.chain.get_latest_block()
+        tampered_block = Block(
+            index=latest.index + 1,
+            timestamp=0,
+            process_name="Tampered Block",
+            data=[{"fake": "data"}],
+            previous_hash=latest.hash
+        )
+        # ハッシュを改ざん（ブロック内容と不一致にする）
+        tampered_block.hash = "0000000000000000_FAKE_HASH"
+
+        # 不正ブロックを直接ブロードキャスト
+        for peer in leader.peers:
+            peer.receive_message("PRE_PREPARE", tampered_block, leader.node_id)
+
+        # 不正ブロックは台帳に追加されていないこと
+        for node in nodes:
+            self.assertEqual(len(node.chain.chain), 1, 
+                f"{node.node_id} に不正ブロックが追加されてしまいました")
+
+    def test_consensus_with_one_node_down(self):
+        """3ノード中1ノードがダウンしても、残り2ノードで合意が成立すること"""
+        nodes = self._create_network(3)
+        self._inject_transaction(nodes)
+
+        # Node3をダウンさせる（メッセージを受け付けなくする）
+        down_node = nodes[2]
+        down_node.receive_message = lambda msg_type, payload, sender_id: None
+
+        # リーダーがブロック提案
+        nodes[0].propose_block()
+
+        # 稼働中の2ノードはブロックが確定していること
+        self.assertEqual(len(nodes[0].chain.chain), 2)
+        self.assertEqual(len(nodes[1].chain.chain), 2)
+
+        # ダウンしたノードは台帳が更新されていないこと
+        self.assertEqual(len(down_node.chain.chain), 1)
+
+        # 稼働中の2ノードのハッシュが一致すること
+        self.assertEqual(
+            nodes[0].chain.get_latest_block().hash,
+            nodes[1].chain.get_latest_block().hash
+        )
+
+    def test_consensus_fails_without_quorum(self):
+        """3ノード中2ノードがダウンした場合、定足数不足で合意が成立しないこと"""
+        nodes = self._create_network(3)
+        self._inject_transaction(nodes)
+
+        # Node2とNode3をダウンさせる
+        nodes[1].receive_message = lambda msg_type, payload, sender_id: None
+        nodes[2].receive_message = lambda msg_type, payload, sender_id: None
+
+        # リーダーがブロック提案
+        nodes[0].propose_block()
+
+        # いずれのノードもブロックが確定していないこと
+        for node in nodes:
+            self.assertEqual(len(node.chain.chain), 1,
+                f"{node.node_id} で合意なしにブロックが確定してしまいました")
+
 if __name__ == '__main__':
     unittest.main()

@@ -167,6 +167,15 @@ class Node:
 
     def _handle_pre_prepare(self, block):
         """PRE_PREPARE: リーダーからの提案を受け、PREPAREを全ノードに送る"""
+        # 既に確定済みのブロックは処理しない
+        if self.chain.get_latest_block().hash == block.hash:
+            return
+
+        # ブロックの整合性を検証（ビザンチン障害対策）
+        if not self._validate_block(block):
+            print(f"     [{self.node_id}] 【警告】不正なブロックを検出しました。提案を拒否します。")
+            return
+
         self._ensure_vote_set(block.hash)
 
         if self.node_id not in self.prepares[block.hash]:
@@ -189,11 +198,25 @@ class Node:
         if block.hash not in self.commits:
             self.commits[block.hash] = set()
         self.commits[block.hash].add(sender_id)
+        # 自身がまだCOMMITしていなければ、COMMITに参加する
+        # （ダウンノードがいるとPREPAREだけでは定足数に達しない場合があるため）
+        if self.node_id not in self.commits[block.hash]:
+            self.commits[block.hash].add(self.node_id)
+            self.broadcast("COMMIT", block)
         self._try_finalize(block)
 
     # ------------------------------------------
     # PBFT 内部ヘルパー
     # ------------------------------------------
+    def _validate_block(self, block):
+        """ブロックの整合性を検証する（ハッシュ値の再計算チェック）"""
+        if block.hash != block.calculate_hash():
+            return False
+        # previous_hashが自身のチェーンの最新ブロックと一致するか
+        if block.previous_hash != self.chain.get_latest_block().hash:
+            return False
+        return True
+
     def _ensure_vote_set(self, block_hash):
         """投票セットが未初期化であれば初期化する"""
         if block_hash not in self.prepares:
@@ -208,6 +231,9 @@ class Node:
                 self.commits[block.hash].add(self.node_id)
                 print(f"     [{self.node_id}] 定足数のPREPAREを受信。COMMITをブロードキャストします。")
                 self.broadcast("COMMIT", block)
+                # ブロードキャスト中に他ノードからのCOMMITが届き、
+                # 既に定足数に達している可能性があるためチェックする
+                self._try_finalize(block)
 
     def _try_finalize(self, block):
         """COMMIT票が定足数に達していたらブロックを台帳に確定する"""

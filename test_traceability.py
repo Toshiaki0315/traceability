@@ -100,5 +100,54 @@ class TestNetworkSimulation(unittest.TestCase):
         self.assertEqual(node2.received_messages[0], ("TEST_MSG", {"info": "hello"}, "Node1"))
         self.assertEqual(len(node3.received_messages), 1)
 
+class TestTransactionSeparation(unittest.TestCase):
+    def test_pending_transactions(self):
+        """トランザクションを受信するとpending_transactionsに追加されること"""
+        from traceability import Node, sign_data, generate_keypair
+        node = Node("Node1", "Replica")
+        pub, priv = generate_keypair()
+        
+        test_data = {"test": 123}
+        signature = sign_data(test_data, priv)
+        
+        payload = {
+            "data": test_data,
+            "signature": signature,
+            "public_key": pub
+        }
+        
+        # メッセージを受信
+        node.receive_message("NEW_TRANSACTION", payload, "Sender1")
+        
+        # pending_transactionsに追加されていることを確認
+        self.assertEqual(len(node.pending_transactions), 1)
+        self.assertEqual(node.pending_transactions[0], payload)
+
+    def test_leader_block_proposal(self):
+        """Leaderノードがpending_transactionsからブロック候補を作成できること"""
+        from traceability import Node, sign_data, generate_keypair
+        leader = Node("LeaderNode", "Leader")
+        replica = Node("ReplicaNode", "Replica")
+        
+        pub, priv = generate_keypair()
+        test_data = {"test": 123}
+        payload = {"data": test_data, "signature": sign_data(test_data, priv), "public_key": pub}
+        
+        # トランザクションを追加
+        leader.receive_message("NEW_TRANSACTION", payload, "Sender1")
+        replica.receive_message("NEW_TRANSACTION", payload, "Sender1")
+        
+        # レプリカはpropose_blockできない
+        with self.assertRaises(PermissionError):
+            replica.propose_block()
+            
+        # リーダーはpropose_blockできる（ブロックが返る）
+        proposed_block = leader.propose_block()
+        self.assertIsNotNone(proposed_block)
+        # 作成されたブロックにはトランザクションが含まれている
+        self.assertEqual(proposed_block.data, [payload])
+        # pending_transactionsは空になる
+        self.assertEqual(len(leader.pending_transactions), 0)
+
 if __name__ == '__main__':
     unittest.main()

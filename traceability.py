@@ -43,7 +43,7 @@ class Block:
             "process_name": self.process_name,
             "data": self.data,
             "previous_hash": self.previous_hash
-        }, sort_keys=True).encode()
+        }, sort_keys=True, default=str).encode()
         return hashlib.sha256(block_string).hexdigest()
 
 class TraceabilityChain:
@@ -110,6 +110,7 @@ class Node:
         self.public_key, self.private_key = generate_keypair()
         self.chain = TraceabilityChain()
         self.peers = []
+        self.pending_transactions = []  # 未承認トランザクションのリスト
 
     def add_peer(self, node):
         """P2Pネットワークのピア（通信相手）を登録する"""
@@ -125,8 +126,48 @@ class Node:
     def receive_message(self, msg_type, payload, sender_id):
         """他ノードからメッセージを受信した際の処理"""
         print(f"  -> [{self.node_id}] メッセージ受信 from {sender_id}: {msg_type}")
-        # ステップ3以降でトランザクション処理やPBFTの合意形成処理をここに追加します
-        pass
+        
+        if msg_type == "NEW_TRANSACTION":
+            # 署名検証を行ってから pending_transactions に追加
+            data = payload.get("data")
+            signature = payload.get("signature")
+            pub_key = payload.get("public_key")
+            
+            if verify_signature(data, signature, pub_key):
+                self.pending_transactions.append(payload)
+                print(f"     [{self.node_id}] トランザクションを未承認リストに追加しました。")
+            else:
+                print(f"     [{self.node_id}] 【警告】不正な署名のトランザクションを破棄しました。")
+                
+        # ステップ4以降でPBFTの合意形成処理をここに追加します
+
+    def propose_block(self):
+        """リーダーノードが未承認トランザクションをまとめて新しいブロック候補を提案する"""
+        if self.role != "Leader":
+            raise PermissionError("ブロックを提案できるのはLeaderノードのみです。")
+            
+        if not self.pending_transactions:
+            print(f"[{self.node_id}] 提案するトランザクションがありません。")
+            return None
+            
+        # 溜まっているトランザクションを取得（今回は全て）
+        transactions_to_block = self.pending_transactions.copy()
+        self.pending_transactions.clear()
+        
+        # 新しいブロック候補を作成（まだ自身のチェーンには追加しない）
+        latest_block = self.chain.get_latest_block()
+        proposed_block = Block(
+            index=latest_block.index + 1,
+            timestamp=int(time.time()),
+            process_name="PBFT Proposed Block",
+            data=transactions_to_block,
+            previous_hash=latest_block.hash
+        )
+        
+        print(f"[{self.node_id}] 新しいブロック候補を作成しました。全ノードに提案(PRE_PREPARE)します。")
+        # ブロードキャストして全ノードに提案
+        self.broadcast("PRE_PREPARE", proposed_block)
+        return proposed_block
 
 # ==========================================
 # 実行サンプル
@@ -149,8 +190,8 @@ if __name__ == "__main__":
                 n1.add_peer(n2)
     print("[INFO] ネットワークの構築完了。各ノードが接続されました。\n")
 
-    # 3. 通信テスト（ブロードキャストのシミュレーション）
-    print("=== P2P通信テスト ===")
+    # 3. トランザクション送信テスト
+    print("=== トランザクション送信テスト ===")
     
     # 例：納入業者がトランザクションデータを送信する
     test_data = {"lot_number": "RAW-A001", "supplier": "A社", "weight_kg": 500}
@@ -162,7 +203,12 @@ if __name__ == "__main__":
         "public_key": node_supplier.public_key
     }
     
-    # 納入業者が全ノードにメッセージを送信
+    # 納入業者が全ノードにメッセージを送信（ブロードキャスト）
     node_supplier.broadcast("NEW_TRANSACTION", payload)
     
-    print("\n[INFO] ステップ2（複数ノード環境構築）完了！")
+    # 4. リーダーノードによるブロック提案テスト
+    print("\n=== リーダーノードによるブロック提案テスト ===")
+    # リーダーノード（加工工場）がトランザクションをまとめてブロック化を提案
+    node_factory.propose_block()
+    
+    print("\n[INFO] ステップ3（トランザクション分離とリーダーの役割）完了！")

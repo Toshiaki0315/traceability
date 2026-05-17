@@ -100,46 +100,69 @@ class TraceabilityChain:
             print(f"Current Hash : {block.hash}\n")
 
 # ==========================================
+# ステップ2: P2Pネットワーク・ノードの構築
+# ==========================================
+class Node:
+    def __init__(self, node_id, role):
+        self.node_id = node_id
+        self.role = role  # "Leader" または "Replica"
+        # 各ノードは自身の鍵ペアと独立したチェーン（台帳）を持つ
+        self.public_key, self.private_key = generate_keypair()
+        self.chain = TraceabilityChain()
+        self.peers = []
+
+    def add_peer(self, node):
+        """P2Pネットワークのピア（通信相手）を登録する"""
+        if node not in self.peers:
+            self.peers.append(node)
+
+    def broadcast(self, msg_type, payload):
+        """登録された全ピアに対してメッセージを送信（ブロードキャスト）する"""
+        print(f"[{self.node_id}] ブロードキャスト送信: {msg_type}")
+        for peer in self.peers:
+            peer.receive_message(msg_type, payload, self.node_id)
+
+    def receive_message(self, msg_type, payload, sender_id):
+        """他ノードからメッセージを受信した際の処理"""
+        print(f"  -> [{self.node_id}] メッセージ受信 from {sender_id}: {msg_type}")
+        # ステップ3以降でトランザクション処理やPBFTの合意形成処理をここに追加します
+        pass
+
+# ==========================================
 # 実行サンプル
 # ==========================================
 if __name__ == "__main__":
-    # 参加者の鍵ペア生成
-    print("[INFO] 各参加者（納入業者、工場、倉庫）の鍵ペアを生成しています...")
-    supplier_pub, supplier_priv = generate_keypair()
-    factory_pub, factory_priv = generate_keypair()
-    warehouse_pub, warehouse_priv = generate_keypair()
-    print("[INFO] 鍵ペア生成完了。\n")
+    print("[INFO] P2Pシミュレーション環境の構築を開始します...\n")
 
-    # 1. トレーサビリティシステムの初期化
-    supply_chain = TraceabilityChain()
+    # 1. 参加ノードの立ち上げ
+    print("[INFO] 各参加者ノードを起動し、鍵ペアと台帳を初期化しています...")
+    node_supplier = Node("納入業者", "Replica")
+    node_factory = Node("加工工場", "Leader")
+    node_warehouse = Node("倉庫", "Replica")
+    print("[INFO] ノード起動完了。\n")
 
-    # 2. 各工程のデータを順次記録していく
-    print("[INFO] 工程データをブロックチェーンに記録します...\n")
+    # 2. P2Pネットワークの構築（相互にピアとして登録）
+    nodes = [node_supplier, node_factory, node_warehouse]
+    for n1 in nodes:
+        for n2 in nodes:
+            if n1 != n2:
+                n1.add_peer(n2)
+    print("[INFO] ネットワークの構築完了。各ノードが接続されました。\n")
+
+    # 3. 通信テスト（ブロードキャストのシミュレーション）
+    print("=== P2P通信テスト ===")
     
-    # 工程1: 原材料受け入れ（納入業者が署名）
-    data1 = {"lot_number": "RAW-A001", "supplier": "A社", "weight_kg": 500}
-    sig1 = sign_data(data1, supplier_priv)
-    supply_chain.add_process_data(process_name="原材料受け入れ", data=data1, public_key=supplier_pub, signature=sig1)
-
-    # 工程2: 加熱・加工処理（工場が署名）
-    data2 = {"sensor_type": "NCIR2", "surface_temp_celsius": 65.2, "operator_id": "OP-773"}
-    sig2 = sign_data(data2, factory_priv)
-    supply_chain.add_process_data(process_name="加熱処理", data=data2, public_key=factory_pub, signature=sig2)
-
-    # 工程3: 出荷・梱包（倉庫が署名）
-    data3 = {"destination": "Yokohama Warehouse", "shipping_id": "SHIP-9992"}
-    sig3 = sign_data(data3, warehouse_priv)
-    supply_chain.add_process_data(process_name="出荷", data=data3, public_key=warehouse_pub, signature=sig3)
-
-    # 3. チェーンの全容を表示
-    supply_chain.display_chain()
-
-    # 4. データ検証（正しい状態）
-    print(f"[検証] 現在のデータは正当ですか？ -> {supply_chain.is_chain_valid()}\n")
-
-    # 5. 改ざんのシミュレーション（意図的に過去のデータを書き換える）
-    print("[INFO] 過去のデータ（工程2の温度データ）が改ざんされました...")
-    supply_chain.chain[2].data["surface_temp_celsius"] = 55.0  # 規定温度を満たしていなかったことにする
+    # 例：納入業者がトランザクションデータを送信する
+    test_data = {"lot_number": "RAW-A001", "supplier": "A社", "weight_kg": 500}
+    signature = sign_data(test_data, node_supplier.private_key)
     
-    # 改ざん後の検証
-    print(f"[検証] 記録後のデータ改ざんを検知できましたか？ -> {not supply_chain.is_chain_valid()}")
+    payload = {
+        "data": test_data,
+        "signature": signature,
+        "public_key": node_supplier.public_key
+    }
+    
+    # 納入業者が全ノードにメッセージを送信
+    node_supplier.broadcast("NEW_TRANSACTION", payload)
+    
+    print("\n[INFO] ステップ2（複数ノード環境構築）完了！")

@@ -46,5 +46,59 @@ class TestTraceabilitySignature(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.chain.add_process_data("温度記録", self.test_data, self.public_key, invalid_signature)
 
+class TestNetworkSimulation(unittest.TestCase):
+    def test_node_initialization(self):
+        """Nodeクラスが正しく初期化され、必要な属性を持つこと"""
+        from traceability import Node
+        node = Node("Supplier_A", "Replica")
+        self.assertEqual(node.node_id, "Supplier_A")
+        self.assertEqual(node.role, "Replica")
+        self.assertIsNotNone(node.chain)
+        self.assertIsNotNone(node.public_key)
+        self.assertIsNotNone(node.private_key)
+        self.assertEqual(len(node.peers), 0)
+
+    def test_peer_registration(self):
+        """ノード同士がお互いをピアとして登録し合えること"""
+        from traceability import Node
+        node1 = Node("Node1", "Leader")
+        node2 = Node("Node2", "Replica")
+        
+        node1.add_peer(node2)
+        node2.add_peer(node1)
+        
+        self.assertIn(node2, node1.peers)
+        self.assertIn(node1, node2.peers)
+        
+    def test_broadcast_message(self):
+        """あるノードがメッセージをブロードキャストした際、全ピアが受信できること"""
+        from traceability import Node
+        node1 = Node("Node1", "Leader")
+        node2 = Node("Node2", "Replica")
+        node3 = Node("Node3", "Replica")
+        
+        node1.add_peer(node2)
+        node1.add_peer(node3)
+        
+        # モックの代わりに、受信したメッセージを記録するリストを追加しておく
+        node2.received_messages = []
+        node3.received_messages = []
+        
+        # 既存のreceive_messageメソッドを一時的にオーバーライドして記録するようにする
+        def receive_mock2(msg_type, payload, sender_id):
+            node2.received_messages.append((msg_type, payload, sender_id))
+            
+        def receive_mock3(msg_type, payload, sender_id):
+            node3.received_messages.append((msg_type, payload, sender_id))
+            
+        node2.receive_message = receive_mock2
+        node3.receive_message = receive_mock3
+        
+        node1.broadcast("TEST_MSG", {"info": "hello"})
+        
+        self.assertEqual(len(node2.received_messages), 1)
+        self.assertEqual(node2.received_messages[0], ("TEST_MSG", {"info": "hello"}, "Node1"))
+        self.assertEqual(len(node3.received_messages), 1)
+
 if __name__ == '__main__':
     unittest.main()

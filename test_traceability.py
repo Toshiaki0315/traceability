@@ -384,5 +384,69 @@ class TestChainPersistence(unittest.TestCase):
             new_node.chain.get_latest_block().hash
         )
 
+class TestBusinessRules(unittest.TestCase):
+    """ステップ7: スマートコントラクト的なビジネスルール検証テスト"""
+
+    def test_add_and_execute_business_rule(self):
+        """ビジネスルールを追加し、ルールを満たすトランザクションが追加されること"""
+        from traceability import Node, sign_data, generate_keypair
+        node = Node("Node1", "Replica")
+        pub, priv = generate_keypair()
+
+        # ルール設定: 加熱工程の場合、温度が65度以上でなければならない
+        def heating_temp_rule(payload):
+            data = payload.get("data", {})
+            if data.get("process") == "heating":
+                temp = data.get("temperature", 0)
+                if temp < 65.0:
+                    raise ValueError("加熱温度が低すぎます")
+            return True
+
+        node.add_business_rule(heating_temp_rule)
+
+        # ルールを満たすトランザクション
+        valid_data = {"process": "heating", "temperature": 68.5}
+        valid_payload = {
+            "data": valid_data,
+            "signature": sign_data(valid_data, priv),
+            "public_key": pub
+        }
+
+        node.receive_message("NEW_TRANSACTION", valid_payload, "Sender1")
+
+        # トランザクションが正常に受け入れられていること
+        self.assertEqual(len(node.pending_transactions), 1)
+        self.assertEqual(node.pending_transactions[0], valid_payload)
+
+    def test_violate_business_rule_rejected(self):
+        """ビジネスルールに違反するトランザクションが拒否されること"""
+        from traceability import Node, sign_data, generate_keypair
+        node = Node("Node1", "Replica")
+        pub, priv = generate_keypair()
+
+        # ルール設定
+        def heating_temp_rule(payload):
+            data = payload.get("data", {})
+            if data.get("process") == "heating":
+                temp = data.get("temperature", 0)
+                if temp < 65.0:
+                    raise ValueError("加熱温度が低すぎます")
+            return True
+
+        node.add_business_rule(heating_temp_rule)
+
+        # ルールに違反するトランザクション (60.0度)
+        invalid_data = {"process": "heating", "temperature": 60.0}
+        invalid_payload = {
+            "data": invalid_data,
+            "signature": sign_data(invalid_data, priv),
+            "public_key": pub
+        }
+
+        node.receive_message("NEW_TRANSACTION", invalid_payload, "Sender1")
+
+        # トランザクションが追加されずに破棄されていること
+        self.assertEqual(len(node.pending_transactions), 0)
+
 if __name__ == '__main__':
     unittest.main()

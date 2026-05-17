@@ -180,11 +180,16 @@ class Node:
         # PBFTの投票管理用
         self.prepares = {}  # {block_hash: set(node_ids)}
         self.commits = {}   # {block_hash: set(node_ids)}
+        self.business_rules = []
 
     def add_peer(self, node):
         """P2Pネットワークのピア（通信相手）を登録する"""
         if node not in self.peers:
             self.peers.append(node)
+
+    def add_business_rule(self, rule_func):
+        """ノードに新しいビジネスルール（検証用関数）を登録する"""
+        self.business_rules.append(rule_func)
 
     # ------------------------------------------
     # 台帳の永続化（ステップ6）
@@ -222,16 +227,28 @@ class Node:
             self._handle_commit(payload, sender_id)
 
     def _handle_new_transaction(self, payload):
-        """NEW_TRANSACTION: 署名検証を行ってから未承認リストに追加する"""
+        """NEW_TRANSACTION: 署名検証および登録されたすべてのビジネスルールを適用してから未承認リストに追加する"""
         data = payload.get("data")
         signature = payload.get("signature")
         pub_key = payload.get("public_key")
 
-        if verify_signature(data, signature, pub_key):
-            self.pending_transactions.append(payload)
-            print(f"     [{self.node_id}] トランザクションを未承認リストに追加しました。")
-        else:
+        # 1. 電子署名の検証
+        if not verify_signature(data, signature, pub_key):
             print(f"     [{self.node_id}] 【警告】不正な署名のトランザクションを破棄しました。")
+            return
+
+        # 2. ビジネスルールの検証 (スマートコントラクト的処理)
+        for rule in self.business_rules:
+            try:
+                if not rule(payload):
+                    print(f"     [{self.node_id}] 【警告】ビジネスルール検証に失敗したためトランザクションを破棄しました。")
+                    return
+            except Exception as e:
+                print(f"     [{self.node_id}] 【警告】ビジネスルール検証中にエラーが発生したためトランザクションを破棄しました: {e}")
+                return
+
+        self.pending_transactions.append(payload)
+        print(f"     [{self.node_id}] トランザクションを未承認リストに追加しました。")
 
     def _handle_pre_prepare(self, block):
         """PRE_PREPARE: リーダーからの提案を受け、PREPAREを全ノードに送る"""
@@ -373,12 +390,36 @@ if __name__ == "__main__":
         for n2 in nodes:
             if n1 != n2:
                 n1.add_peer(n2)
-    print("[Phase 1] ネットワークの構築完了。各ノードが接続されました。\n")
+    print("[Phase 1] ネットワークの構築完了。各ノードが接続されました。")
+
+    # ビジネスルールの定義と登録
+    def weight_check_rule(payload):
+        data = payload.get("data", {})
+        weight = data.get("weight_kg", 0)
+        if weight < 100:
+            raise ValueError(f"原料重量({weight}kg)が少なすぎます。最低100kg必要です。")
+        return True
+
+    for node in nodes:
+        node.add_business_rule(weight_check_rule)
+    print("[Phase 1] ビジネスルール（最低重量100kg）を全ノードに登録しました。\n")
 
     # ------------------------------------------
     # フェーズ2: トランザクションの送信
     # ------------------------------------------
-    print("--- Phase 2: トランザクション送信 ---")
+    print("--- Phase 2: トランザクション送信 (ルール違反のテスト) ---")
+    invalid_data = {"lot_number": "RAW-A001", "supplier": "A社", "weight_kg": 50}
+    invalid_sig = sign_data(invalid_data, node_supplier.private_key)
+    invalid_payload = {
+        "data": invalid_data,
+        "signature": invalid_sig,
+        "public_key": node_supplier.public_key
+    }
+    # 納入業者が全ノードにトランザクションをブロードキャスト（拒否されるはず）
+    node_supplier.broadcast("NEW_TRANSACTION", invalid_payload)
+    print()
+
+    print("--- Phase 2: トランザクション送信 (正常データの送信) ---")
     test_data = {"lot_number": "RAW-A001", "supplier": "A社", "weight_kg": 500}
     signature = sign_data(test_data, node_supplier.private_key)
 

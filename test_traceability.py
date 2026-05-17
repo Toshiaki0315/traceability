@@ -149,5 +149,47 @@ class TestTransactionSeparation(unittest.TestCase):
         # pending_transactionsは空になる
         self.assertEqual(len(leader.pending_transactions), 0)
 
+class TestPBFTSimulation(unittest.TestCase):
+    def test_pbft_consensus_flow(self):
+        """PBFTの合意形成フロー（PRE_PREPARE -> PREPARE -> COMMIT -> 確定）が正しく連鎖すること"""
+        from traceability import Node, sign_data, generate_keypair
+        
+        node1 = Node("Node1(Leader)", "Leader")
+        node2 = Node("Node2(Replica)", "Replica")
+        node3 = Node("Node3(Replica)", "Replica")
+        
+        # ピア登録
+        nodes = [node1, node2, node3]
+        for n1 in nodes:
+            for n2 in nodes:
+                if n1 != n2:
+                    n1.add_peer(n2)
+                    
+        # トランザクション準備
+        pub, priv = generate_keypair()
+        test_data = {"test": "PBFT Flow"}
+        payload = {"data": test_data, "signature": sign_data(test_data, priv), "public_key": pub}
+        
+        # トランザクション送信（全員のpendingに追加）
+        node1.receive_message("NEW_TRANSACTION", payload, "Sender1")
+        node2.receive_message("NEW_TRANSACTION", payload, "Sender1")
+        node3.receive_message("NEW_TRANSACTION", payload, "Sender1")
+        
+        # リーダーが提案（ここから連鎖的に通信が行われる）
+        node1.propose_block()
+        
+        # 全ノードのチェーンに新しいブロックが追加されていることを確認（初期状態1 + 新規1 = 2）
+        self.assertEqual(len(node1.chain.chain), 2)
+        self.assertEqual(len(node2.chain.chain), 2)
+        self.assertEqual(len(node3.chain.chain), 2)
+        
+        # 全ノードの確定したブロック（ハッシュ）が一致していること
+        hash1 = node1.chain.get_latest_block().hash
+        hash2 = node2.chain.get_latest_block().hash
+        hash3 = node3.chain.get_latest_block().hash
+        
+        self.assertEqual(hash1, hash2)
+        self.assertEqual(hash2, hash3)
+
 if __name__ == '__main__':
     unittest.main()

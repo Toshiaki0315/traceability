@@ -111,6 +111,10 @@ class Node:
         self.chain = TraceabilityChain()
         self.peers = []
         self.pending_transactions = []  # 未承認トランザクションのリスト
+        
+        # PBFTの投票管理用
+        self.prepares = {}
+        self.commits = {}
 
     def add_peer(self, node):
         """P2Pネットワークのピア（通信相手）を登録する"""
@@ -139,7 +143,53 @@ class Node:
             else:
                 print(f"     [{self.node_id}] 【警告】不正な署名のトランザクションを破棄しました。")
                 
-        # ステップ4以降でPBFTの合意形成処理をここに追加します
+        elif msg_type == "PRE_PREPARE":
+            block = payload
+            if block.hash not in self.prepares:
+                self.prepares[block.hash] = set()
+                
+            if self.node_id not in self.prepares[block.hash]:
+                self.prepares[block.hash].add(self.node_id) # 自身も賛成票を入れる
+                print(f"     [{self.node_id}] PRE_PREPAREを受信しました。PREPAREをブロードキャストします。")
+                self.broadcast("PREPARE", block)
+                
+                quorum = 2
+                if len(self.prepares[block.hash]) >= quorum:
+                    if block.hash not in self.commits:
+                        self.commits[block.hash] = set()
+                    if self.node_id not in self.commits[block.hash]:
+                        self.commits[block.hash].add(self.node_id)
+                        print(f"     [{self.node_id}] 定足数のPREPAREに達しました。COMMITをブロードキャストします。")
+                        self.broadcast("COMMIT", block)
+                
+        elif msg_type == "PREPARE":
+            block = payload
+            if block.hash not in self.prepares:
+                self.prepares[block.hash] = set()
+            self.prepares[block.hash].add(sender_id)
+            
+            # 定足数（自分を含め2ノード以上の賛成）に達したかチェック
+            quorum = 2
+            if len(self.prepares[block.hash]) >= quorum:
+                if block.hash not in self.commits:
+                    self.commits[block.hash] = set()
+                if self.node_id not in self.commits[block.hash]:
+                    self.commits[block.hash].add(self.node_id)
+                    print(f"     [{self.node_id}] 定足数のPREPAREを受信。COMMITをブロードキャストします。")
+                    self.broadcast("COMMIT", block)
+                    
+        elif msg_type == "COMMIT":
+            block = payload
+            if block.hash not in self.commits:
+                self.commits[block.hash] = set()
+            self.commits[block.hash].add(sender_id)
+            
+            quorum = 2
+            if len(self.commits[block.hash]) >= quorum:
+                # まだブロックチェーンに追加していなければ追加（確定）
+                if self.chain.get_latest_block().hash != block.hash:
+                    self.chain.chain.append(block)
+                    print(f"[{self.node_id}] ★ブロック確定！ (Hash: {block.hash[:8]}...)")
 
     def propose_block(self):
         """リーダーノードが未承認トランザクションをまとめて新しいブロック候補を提案する"""
@@ -165,8 +215,21 @@ class Node:
         )
         
         print(f"[{self.node_id}] 新しいブロック候補を作成しました。全ノードに提案(PRE_PREPARE)します。")
+        # リーダー自身もPREPARE票を入れておく
+        self.prepares[proposed_block.hash] = {self.node_id}
+        
         # ブロードキャストして全ノードに提案
         self.broadcast("PRE_PREPARE", proposed_block)
+        
+        # 提案後、自分自身のPREPAREが定足数に達しているかチェック（2ノードシステムの場合など）
+        quorum = 2
+        if len(self.prepares[proposed_block.hash]) >= quorum:
+            if proposed_block.hash not in self.commits:
+                self.commits[proposed_block.hash] = set()
+            if self.node_id not in self.commits[proposed_block.hash]:
+                self.commits[proposed_block.hash].add(self.node_id)
+                self.broadcast("COMMIT", proposed_block)
+                
         return proposed_block
 
 # ==========================================

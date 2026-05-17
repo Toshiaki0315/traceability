@@ -1,0 +1,78 @@
+# ========================================
+# Security & Credentials (セキュリティ関連)
+# ========================================
+# 環境変数や秘密鍵、認証情報を含む可能性のあるファイルをトップで除外します
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+*.pfx
+secrets.json
+credentials.json
+config.json
+auth.json
+
+# ログやデータベース (予期せぬデータ流出を防ぐ)
+*.log
+*.sqlite3
+*.db
+*.dat
+
+# ========================================
+# Python
+# ========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments (仮想環境)
+venv/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ========================================
+# OS / Environment (OS固有ファイル)
+# ========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ========================================
+# IDE / Editor (エディタ固有ファイル)
+# ========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

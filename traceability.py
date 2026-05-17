@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import time
 import rsa
 
@@ -55,8 +56,8 @@ class TraceabilityChain:
 
     def create_genesis_block(self):
         """チェーンの起点となる最初のブロック（ジェネシスブロック）を生成"""
-        # タイムスタンプは環境によるハッシュ値のブレを防ぐため整数（Unixタイム）を使用
-        return Block(0, int(time.time()), "System Initialization", {"info": "Traceability Chain Started"}, "0")
+        # ジェネシスブロックのタイムスタンプは固定値（全ノードで同一のハッシュにするため）
+        return Block(0, 0, "System Initialization", {"info": "Traceability Chain Started"}, "0")
 
     def get_latest_block(self):
         return self.chain[-1]
@@ -102,6 +103,60 @@ class TraceabilityChain:
             print(f"Previous Hash: {block.previous_hash}")
             print(f"Current Hash : {block.hash}\n")
 
+    # ------------------------------------------
+    # 台帳の永続化（ステップ6）
+    # ------------------------------------------
+    def save_chain(self, filepath):
+        """チェーンの全ブロックをJSON形式でファイルに保存する"""
+        chain_data = []
+        for block in self.chain:
+            chain_data.append({
+                "index": block.index,
+                "timestamp": block.timestamp,
+                "process_name": block.process_name,
+                "data": block.data,
+                "previous_hash": block.previous_hash,
+                "hash": block.hash
+            })
+        
+        os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else ".", exist_ok=True)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(chain_data, f, ensure_ascii=False, indent=2, default=str)
+        print(f"[INFO] チェーンを保存しました: {filepath}")
+
+    @classmethod
+    def load_chain(cls, filepath):
+        """ファイルからチェーンを復元し、ハッシュの整合性を検証する"""
+        with open(filepath, "r", encoding="utf-8") as f:
+            chain_data = json.load(f)
+
+        # ブロックを復元
+        chain_instance = cls.__new__(cls)
+        chain_instance.chain = []
+        for block_dict in chain_data:
+            block = Block(
+                index=block_dict["index"],
+                timestamp=block_dict["timestamp"],
+                process_name=block_dict["process_name"],
+                data=block_dict["data"],
+                previous_hash=block_dict["previous_hash"]
+            )
+            # 復元したブロックのハッシュが保存時と一致するか検証
+            if block.hash != block_dict["hash"]:
+                raise ValueError(
+                    f"【改ざん検知】Block {block.index} のデータが保存後に変更されています。"
+                    f"\n  保存時Hash: {block_dict['hash']}"
+                    f"\n  再計算Hash: {block.hash}"
+                )
+            chain_instance.chain.append(block)
+
+        # チェーン全体のリンク整合性も検証
+        if not chain_instance.is_chain_valid():
+            raise ValueError("【改ざん検知】チェーンのリンク構造が破損しています。")
+
+        print(f"[INFO] チェーンを復元しました: {filepath} ({len(chain_instance.chain)} ブロック)")
+        return chain_instance
+
 
 # ==========================================
 # P2Pネットワーク・ノードとPBFT合意形成
@@ -130,6 +185,19 @@ class Node:
         """P2Pネットワークのピア（通信相手）を登録する"""
         if node not in self.peers:
             self.peers.append(node)
+
+    # ------------------------------------------
+    # 台帳の永続化（ステップ6）
+    # ------------------------------------------
+    def save_state(self, data_dir):
+        """ノードのチェーンをファイルに保存する"""
+        filepath = os.path.join(data_dir, f"{self.node_id}_chain.json")
+        self.chain.save_chain(filepath)
+
+    def load_state(self, data_dir):
+        """ファイルからチェーンを復元する"""
+        filepath = os.path.join(data_dir, f"{self.node_id}_chain.json")
+        self.chain = TraceabilityChain.load_chain(filepath)
 
     def broadcast(self, msg_type, payload):
         """登録された全ピアに対してメッセージを送信（ブロードキャスト）する"""
@@ -344,6 +412,21 @@ if __name__ == "__main__":
         print("\n✅ 全ノードの台帳が一致しています。合意形成に成功しました！")
     else:
         print("\n❌ 台帳の不一致が検出されました。")
+
+    # ------------------------------------------
+    # フェーズ5: 台帳の永続化
+    # ------------------------------------------
+    print("\n--- Phase 5: 台帳の永続化 ---")
+    data_dir = "data"
+    for node in nodes:
+        node.save_state(data_dir)
+
+    # 復元テスト（新しいノードで台帳を読み込む）
+    print("\n[INFO] 保存した台帳を新しいノードで復元します...")
+    restored_node = Node("加工工場", "Leader")
+    restored_node.load_state(data_dir)
+    print(f"[INFO] 復元されたチェーン長: {len(restored_node.chain.chain)}")
+    print(f"[INFO] 最新ブロックHash: {restored_node.chain.get_latest_block().hash[:16]}...")
 
     print("\n" + "=" * 60)
     print("  シミュレーション完了")

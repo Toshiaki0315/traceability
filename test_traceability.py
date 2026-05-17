@@ -287,5 +287,102 @@ class TestByzantineFaultTolerance(unittest.TestCase):
             self.assertEqual(len(node.chain.chain), 1,
                 f"{node.node_id} で合意なしにブロックが確定してしまいました")
 
+class TestChainPersistence(unittest.TestCase):
+    """ステップ6: 台帳の永続化テスト"""
+
+    def setUp(self):
+        """テスト用の一時ディレクトリを作成"""
+        import tempfile, os
+        self.test_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        """テスト用の一時ディレクトリを削除"""
+        import shutil
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_save_and_load_chain(self):
+        """チェーンをJSONに保存し、復元して内容が一致すること"""
+        import os
+        chain = TraceabilityChain()
+        pub, priv = generate_keypair()
+
+        # ブロックを2つ追加
+        data1 = {"lot": "A001", "temp": 65.0}
+        sig1 = sign_data(data1, priv)
+        chain.add_process_data("加熱処理", data1, pub, sig1)
+
+        data2 = {"destination": "Yokohama", "shipping_id": "SHIP-001"}
+        sig2 = sign_data(data2, priv)
+        chain.add_process_data("出荷", data2, pub, sig2)
+
+        # 保存
+        filepath = os.path.join(self.test_dir, "test_chain.json")
+        chain.save_chain(filepath)
+        self.assertTrue(os.path.exists(filepath))
+
+        # 復元
+        loaded_chain = TraceabilityChain.load_chain(filepath)
+
+        # ブロック数が一致
+        self.assertEqual(len(loaded_chain.chain), len(chain.chain))
+
+        # 各ブロックのハッシュが一致
+        for orig, loaded in zip(chain.chain, loaded_chain.chain):
+            self.assertEqual(orig.hash, loaded.hash)
+            self.assertEqual(orig.previous_hash, loaded.previous_hash)
+            self.assertEqual(orig.process_name, loaded.process_name)
+
+    def test_load_detects_tampered_file(self):
+        """保存済みファイルが改ざんされた場合、復元時にエラーが発生すること"""
+        import os
+        chain = TraceabilityChain()
+        pub, priv = generate_keypair()
+        data = {"lot": "B002"}
+        sig = sign_data(data, priv)
+        chain.add_process_data("検査", data, pub, sig)
+
+        filepath = os.path.join(self.test_dir, "tampered_chain.json")
+        chain.save_chain(filepath)
+
+        # ファイルを読み込んで改ざん
+        with open(filepath, "r") as f:
+            content = json.load(f)
+        content[1]["data"]["lot"] = "TAMPERED"
+        with open(filepath, "w") as f:
+            json.dump(content, f)
+
+        # 復元時にエラーが発生すること
+        with self.assertRaises(ValueError):
+            TraceabilityChain.load_chain(filepath)
+
+    def test_node_save_and_restore(self):
+        """Nodeがチェーンを保存し、新しいノードで復元して台帳を引き継げること"""
+        from traceability import Node
+        import os
+
+        node = Node("TestNode", "Replica")
+        pub, priv = generate_keypair()
+        data = {"test": "persistence"}
+        sig = sign_data(data, priv)
+        node.chain.add_process_data("テスト工程", data, pub, sig)
+
+        # 保存
+        node.save_state(self.test_dir)
+        expected_path = os.path.join(self.test_dir, "TestNode_chain.json")
+        self.assertTrue(os.path.exists(expected_path))
+
+        # 新しいノードで復元
+        new_node = Node("TestNode", "Replica")
+        self.assertEqual(len(new_node.chain.chain), 1)  # まだジェネシスのみ
+
+        new_node.load_state(self.test_dir)
+        self.assertEqual(len(new_node.chain.chain), 2)  # 復元後は2ブロック
+
+        # ハッシュが一致
+        self.assertEqual(
+            node.chain.get_latest_block().hash,
+            new_node.chain.get_latest_block().hash
+        )
+
 if __name__ == '__main__':
     unittest.main()

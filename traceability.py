@@ -1,6 +1,30 @@
 import hashlib
 import json
 import time
+import rsa
+
+# ==========================================
+# 電子署名関連のヘルパー関数（ステップ1）
+# ==========================================
+def generate_keypair():
+    """参加者（納入業者、工場など）の公開鍵・秘密鍵ペアを生成する"""
+    # PoCのため処理速度を優先し、512bitの鍵長を使用
+    return rsa.newkeys(512)
+
+def sign_data(data, private_key):
+    """データ（辞書型）を直列化し、秘密鍵でデジタル署名を生成する"""
+    data_string = json.dumps(data, sort_keys=True).encode()
+    return rsa.sign(data_string, private_key, 'SHA-256')
+
+def verify_signature(data, signature, public_key):
+    """データと署名を受け取り、公開鍵を用いて正当性を検証する"""
+    data_string = json.dumps(data, sort_keys=True).encode()
+    try:
+        rsa.verify(data_string, signature, public_key)
+        return True
+    except rsa.VerificationError:
+        return False
+
 
 class Block:
     def __init__(self, index, timestamp, process_name, data, previous_hash):
@@ -34,12 +58,18 @@ class TraceabilityChain:
     def get_latest_block(self):
         return self.chain[-1]
 
-    def add_process_data(self, process_name, data):
-        """新しい工程のデータをブロックチェーンに追加する"""
+    def add_process_data(self, process_name, data, public_key, signature):
+        """新しい工程のデータをブロックチェーンに追加する（署名検証付き）"""
+        
+        # 1. 署名の検証（Step1の要件）
+        if not verify_signature(data, signature, public_key):
+            raise ValueError("【エラー】無効な署名です。データが改ざんされているか、権限がありません。")
+
+        # 2. ブロック化
         latest_block = self.get_latest_block()
         new_block = Block(
             index=latest_block.index + 1,
-            timestamp=int(time.time()), # 浮動小数点の精度問題を回避するため整数化
+            timestamp=int(time.time()),
             process_name=process_name,
             data=data,
             previous_hash=latest_block.hash
@@ -73,29 +103,33 @@ class TraceabilityChain:
 # 実行サンプル
 # ==========================================
 if __name__ == "__main__":
+    # 参加者の鍵ペア生成
+    print("[INFO] 各参加者（納入業者、工場、倉庫）の鍵ペアを生成しています...")
+    supplier_pub, supplier_priv = generate_keypair()
+    factory_pub, factory_priv = generate_keypair()
+    warehouse_pub, warehouse_priv = generate_keypair()
+    print("[INFO] 鍵ペア生成完了。\n")
+
     # 1. トレーサビリティシステムの初期化
     supply_chain = TraceabilityChain()
 
     # 2. 各工程のデータを順次記録していく
     print("[INFO] 工程データをブロックチェーンに記録します...\n")
     
-    # 工程1: 原材料受け入れ
-    supply_chain.add_process_data(
-        process_name="原材料受け入れ",
-        data={"lot_number": "RAW-A001", "supplier": "A社", "weight_kg": 500}
-    )
+    # 工程1: 原材料受け入れ（納入業者が署名）
+    data1 = {"lot_number": "RAW-A001", "supplier": "A社", "weight_kg": 500}
+    sig1 = sign_data(data1, supplier_priv)
+    supply_chain.add_process_data(process_name="原材料受け入れ", data=data1, public_key=supplier_pub, signature=sig1)
 
-    # 工程2: 加熱・加工処理
-    supply_chain.add_process_data(
-        process_name="加熱処理",
-        data={"sensor_type": "NCIR2", "surface_temp_celsius": 65.2, "operator_id": "OP-773"}
-    )
+    # 工程2: 加熱・加工処理（工場が署名）
+    data2 = {"sensor_type": "NCIR2", "surface_temp_celsius": 65.2, "operator_id": "OP-773"}
+    sig2 = sign_data(data2, factory_priv)
+    supply_chain.add_process_data(process_name="加熱処理", data=data2, public_key=factory_pub, signature=sig2)
 
-    # 工程3: 出荷・梱包
-    supply_chain.add_process_data(
-        process_name="出荷",
-        data={"destination": "Yokohama Warehouse", "shipping_id": "SHIP-9992"}
-    )
+    # 工程3: 出荷・梱包（倉庫が署名）
+    data3 = {"destination": "Yokohama Warehouse", "shipping_id": "SHIP-9992"}
+    sig3 = sign_data(data3, warehouse_priv)
+    supply_chain.add_process_data(process_name="出荷", data=data3, public_key=warehouse_pub, signature=sig3)
 
     # 3. チェーンの全容を表示
     supply_chain.display_chain()

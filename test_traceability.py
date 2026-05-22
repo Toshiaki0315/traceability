@@ -448,5 +448,138 @@ class TestBusinessRules(unittest.TestCase):
         # トランザクションが追加されずに破棄されていること
         self.assertEqual(len(node.pending_transactions), 0)
 
+class TestOffChainOnChainIntegration(unittest.TestCase):
+    """ステップ8: DuckDBを用いたオフチェーン・オンチェーン連携のテスト"""
+
+    def setUp(self):
+        from traceability import Node, OffChainStore
+        # テストごとにインメモリのDuckDBストアを作成
+        self.offchain_store = OffChainStore(db_path=":memory:")
+        self.node_leader = Node("Node1(Leader)", "Leader")
+        self.node_replica = Node("Node2(Replica)", "Replica")
+        
+        # 相互に接続
+        self.node_leader.add_peer(self.node_replica)
+        self.node_replica.add_peer(self.node_leader)
+
+    def tearDown(self):
+        self.offchain_store.close()
+
+    def test_offchain_store_and_anchoring(self):
+        """オフチェーン(DuckDB)への保存と、そのハッシュのオンチェーン合意形成テスト"""
+        from traceability import sign_data
+
+        # 1. オフチェーンへの詳細データ保存
+        record_id = "rec-001"
+        lot_number = "LOT-100"
+        details = {"temperature": 72.3, "duration_sec": 1800, "operator": "Alice"}
+        
+        record_hash = self.offchain_store.save_record(
+            record_id=record_id,
+            lot_number=lot_number,
+            process_name="加熱処理",
+            details=details
+        )
+        
+        self.assertIsNotNone(record_hash)
+        self.assertEqual(len(record_hash), 64) # SHA-256 hash length
+
+        # 2. オンチェーンへのハッシュアンカリング(トランザクション送信)
+        anchor_data = {
+            "record_id": record_id,
+            "hash": record_hash,
+            "lot_number": lot_number
+        }
+        
+        # リーダーの署名をつけてブロードキャスト
+        payload = {
+            "data": anchor_data,
+            "signature": sign_data(anchor_data, self.node_leader.private_key),
+            "public_key": self.node_leader.public_key,
+            "type": "OFFCHAIN_ANCHOR"
+        }
+        
+        self.node_leader.receive_message("NEW_TRANSACTION", payload, "Sender")
+        self.node_replica.receive_message("NEW_TRANSACTION", payload, "Sender")
+
+        
+        # 3. ブロック提案と合意形成の実行
+        self.node_leader.propose_block()
+        
+        # 両ノードの最新ブロックにアンカーが含まれていること
+        latest_block_leader = self.node_leader.chain.get_latest_block()
+        latest_block_replica = self.node_replica.chain.get_latest_block()
+        
+        self.assertEqual(latest_block_leader.hash, latest_block_replica.hash)
+        self.assertEqual(latest_block_leader.process_name, "PBFT Proposed Block")
+        tx = latest_block_leader.data[0]
+        self.assertEqual(tx["type"], "OFFCHAIN_ANCHOR")
+        self.assertEqual(tx["data"]["record_id"], record_id)
+        self.assertEqual(tx["data"]["hash"], record_hash)
+
+
+    def test_audit_verification_success(self):
+        """データが改ざんされていない正常なケースで監査が成功すること"""
+        from traceability import sign_data
+
+        record_id = "rec-002"
+        lot_number = "LOT-200"
+        details = {"pH": 6.8, "humidity": 45}
+        
+        record_hash = self.offchain_store.save_record(record_id, lot_number, "発酵工程", details)
+        
+        # アンカリング
+        anchor_data = {"record_id": record_id, "hash": record_hash, "lot_number": lot_number}
+        payload = {
+            "data": anchor_data,
+            "signature": sign_data(anchor_data, self.node_leader.private_key),
+            "public_key": self.node_leader.public_key,
+            "type": "OFFCHAIN_ANCHOR"
+        }
+        self.node_leader.receive_message("NEW_TRANSACTION", payload, "Sender")
+        self.node_replica.receive_message("NEW_TRANSACTION", payload, "Sender")
+
+        self.node_leader.propose_block()
+
+        # 監査の実行（リーダーがオフチェーンストアと連携して検証）
+        is_valid = self.node_leader.audit_offchain_data(record_id, self.offchain_store)
+        self.assertTrue(is_valid)
+
+    def test_audit_verification_detects_tampering(self):
+        """オフチェーンデータが直接改ざんされた場合に、監査で不一致を検知すること"""
+        from traceability import sign_data
+
+        record_id = "rec-003"
+        lot_number = "LOT-300"
+        details = {"weight_g": 950}
+        
+        record_hash = self.offchain_store.save_record(record_id, lot_number, "包装工程", details)
+        
+        # アンカリング
+        anchor_data = {"record_id": record_id, "hash": record_hash, "lot_number": lot_number}
+        payload = {
+            "data": anchor_data,
+            "signature": sign_data(anchor_data, self.node_leader.private_key),
+            "public_key": self.node_leader.public_key,
+            "type": "OFFCHAIN_ANCHOR"
+        }
+        self.node_leader.receive_message("NEW_TRANSACTION", payload, "Sender")
+        self.node_replica.receive_message("NEW_TRANSACTION", payload, "Sender")
+
+        self.node_leader.propose_block()
+
+        # 監査の成功を確認
+        self.assertTrue(self.node_leader.audit_offchain_data(record_id, self.offchain_store))
+
+        # オフチェーンのDuckDBのデータを直接書き換えて改ざんシミュレーション
+        self.offchain_store.conn.execute(
+            "UPDATE manufacturing_details SET details = ? WHERE record_id = ?",
+            ('{"weight_g": 850}', record_id) # 950g から 850g に数値を改ざん
+        )
+
+        # 再度監査を実行すると、ハッシュ不一致のためFalseが返ることを検証
+        is_valid_after_tamper = self.node_leader.audit_offchain_data(record_id, self.offchain_store)
+        self.assertFalse(is_valid_after_tamper)
+
 if __name__ == '__main__':
     unittest.main()

@@ -3,6 +3,68 @@ import json
 import os
 import time
 import rsa
+import duckdb
+
+# ==========================================
+# オフチェーンデータベース管理 (ステップ8)
+# ==========================================
+class OffChainStore:
+    def __init__(self, db_path="data/offchain_store.db"):
+        self.db_path = db_path
+        if db_path != ":memory:":
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = duckdb.connect(db_path)
+        self._create_table()
+
+    def _create_table(self):
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS manufacturing_details (
+                record_id VARCHAR PRIMARY KEY,
+                lot_number VARCHAR,
+                process_name VARCHAR,
+                details VARCHAR,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+    def save_record(self, record_id, lot_number, process_name, details):
+        """詳細データをオフチェーンDBに保存し、SHA-256ハッシュ値を算出する"""
+        details_str = json.dumps(details, sort_keys=True) if isinstance(details, dict) else str(details)
+        self.conn.execute("""
+            INSERT OR REPLACE INTO manufacturing_details (record_id, lot_number, process_name, details)
+            VALUES (?, ?, ?, ?)
+        """, (record_id, lot_number, process_name, details_str))
+        return self.calculate_record_hash(record_id, lot_number, process_name, details_str)
+
+    def calculate_record_hash(self, record_id, lot_number, process_name, details):
+        """オフチェーンデータレコードに対するSHA-256ハッシュを一貫した方法で計算する"""
+        details_str = json.dumps(details, sort_keys=True) if isinstance(details, dict) else str(details)
+        content = {
+            "record_id": record_id,
+            "lot_number": lot_number,
+            "process_name": process_name,
+            "details": details_str
+        }
+        content_bytes = json.dumps(content, sort_keys=True).encode()
+        return hashlib.sha256(content_bytes).hexdigest()
+
+    def get_record(self, record_id):
+        """指定されたrecord_idのオフチェーンデータを取得する"""
+        res = self.conn.execute("""
+            SELECT record_id, lot_number, process_name, details FROM manufacturing_details
+            WHERE record_id = ?
+        """, (record_id,)).fetchone()
+        if not res:
+            return None
+        return {
+            "record_id": res[0],
+            "lot_number": res[1],
+            "process_name": res[2],
+            "details": res[3]
+        }
+
+    def close(self):
+        self.conn.close()
 
 # ==========================================
 # 電子署名関連のヘルパー関数（ステップ1）
@@ -204,6 +266,59 @@ class Node:
         filepath = os.path.join(data_dir, f"{self.node_id}_chain.json")
         self.chain = TraceabilityChain.load_chain(filepath)
 
+    def audit_offchain_data(self, record_id, offchain_store):
+        """オフチェーンデータ（DuckDB）のハッシュをオンチェーン（ブロックチェーン）と照合して整合性を監査する"""
+        # 1. オフチェーンデータの取得
+        record = offchain_store.get_record(record_id)
+        if not record:
+            print(f"     [{self.node_id}] 【監査警告】オフチェーンDBにレコード {record_id} が存在しません。")
+            return False
+
+        # 2. オフチェーンデータのハッシュ再計算
+        recalculated_hash = offchain_store.calculate_record_hash(
+            record["record_id"],
+            record["lot_number"],
+            record["process_name"],
+            record["details"]
+        )
+
+        # 3. オンチェーン（ブロックチェーン）から該当レコードのアンカーハッシュ値を探索
+        anchored_hash = None
+        # ジェネシス以外のブロックを走査
+        for block in self.chain.chain[1:]:
+            if isinstance(block.data, list):
+                # PBFTブロック内のトランザクションを走査
+                for tx in block.data:
+                    if tx.get("type") == "OFFCHAIN_ANCHOR":
+                        tx_data = tx.get("data", {})
+                        if tx_data.get("record_id") == record_id:
+                            anchored_hash = tx_data.get("hash")
+                            break
+            elif isinstance(block.data, dict):
+                # PBFT前の互換用
+                if block.process_name == "OFFCHAIN_ANCHOR" and block.data.get("record_id") == record_id:
+                    anchored_hash = block.data.get("hash")
+            
+            if anchored_hash:
+                break
+
+        if not anchored_hash:
+            print(f"     [{self.node_id}] 【監査警告】オンチェーン上にレコード {record_id} のアンカーハッシュが見つかりません。")
+            return False
+
+        # 4. ハッシュ比較
+        if recalculated_hash == anchored_hash:
+            print(f"     [{self.node_id}] 【監査成功】レコード {record_id} の整合性を確認しました。")
+            print(f"       オンチェーン登録ハッシュ: {anchored_hash[:16]}...")
+            print(f"       オフチェーン再計算ハッシュ: {recalculated_hash[:16]}...")
+            return True
+        else:
+            print(f"     [{self.node_id}] 【監査警告】レコード {record_id} の改ざんを検知しました！")
+            print(f"       オンチェーン登録ハッシュ: {anchored_hash[:16]}...")
+            print(f"       オフチェーン再計算ハッシュ: {recalculated_hash[:16]}...")
+            return False
+
+
     def broadcast(self, msg_type, payload):
         """登録された全ピアに対してメッセージを送信（ブロードキャスト）する"""
         print(f"[{self.node_id}] ブロードキャスト送信: {msg_type}")
@@ -394,11 +509,15 @@ if __name__ == "__main__":
 
     # ビジネスルールの定義と登録
     def weight_check_rule(payload):
+        # アンカーデータなど特殊トランザクションは重量チェックをスキップ
+        if payload.get("type") == "OFFCHAIN_ANCHOR":
+            return True
         data = payload.get("data", {})
         weight = data.get("weight_kg", 0)
         if weight < 100:
             raise ValueError(f"原料重量({weight}kg)が少なすぎます。最低100kg必要です。")
         return True
+
 
     for node in nodes:
         node.add_business_rule(weight_check_rule)
@@ -469,6 +588,86 @@ if __name__ == "__main__":
     print(f"[INFO] 復元されたチェーン長: {len(restored_node.chain.chain)}")
     print(f"[INFO] 最新ブロックHash: {restored_node.chain.get_latest_block().hash[:16]}...")
 
+    # ------------------------------------------
+    # フェーズ6: DuckDBを用いたオフチェーン・オンチェーン連携 (ステップ8)
+    # ------------------------------------------
+    print("\n--- Phase 6: DuckDBを用いたオフチェーン・オンチェーン連携 ---")
+    
+    # オフチェーンDWH/ストアの準備
+    offchain_db_path = "data/manufacturing_offchain.db"
+    # デモ用のDBファイル初期化
+    if os.path.exists(offchain_db_path):
+        try:
+            os.remove(offchain_db_path)
+        except OSError:
+            pass
+
+    offchain_store = OffChainStore(db_path=offchain_db_path)
+    
+    # ブロックチェーンに乗せるには大容量すぎる詳細な工程ログデータ
+    record_id = "rec-factory-202605"
+    detailed_log = {
+        "operator": "山田 太郎",
+        "equipment_id": "HEATER-X9",
+        "target_temperature_c": 75.0,
+        "actual_temperature_log_c": [74.5, 74.8, 75.1, 75.0, 74.9],
+        "humidity_percent": 48.2,
+        "duration_minutes": 45,
+        "remarks": "加熱ムラなし。加熱処理を正常終了しました。"
+    }
+    
+    print("[Off-chain] 詳細な加工ログデータをDuckDB（オフチェーン）に保存します...")
+    # 保存してハッシュを計算
+    offchain_hash = offchain_store.save_record(
+        record_id=record_id,
+        lot_number="RAW-A001",
+        process_name="詳細加熱加工ログ",
+        details=detailed_log
+    )
+    print(f"[Off-chain] 保存完了。算出されたデータハッシュ値: {offchain_hash}")
+    
+    print("\n[On-chain] レコードIDとハッシュ値のみをアンカーデータとしてブロックチェーンへ記録します...")
+    anchor_data = {
+        "record_id": record_id,
+        "hash": offchain_hash,
+        "lot_number": "RAW-A001"
+    }
+    
+    # 工場ノードが署名したアンカー用のトランザクションペイロードを作成
+    anchor_payload = {
+        "data": anchor_data,
+        "signature": sign_data(anchor_data, node_factory.private_key),
+        "public_key": node_factory.public_key,
+        "type": "OFFCHAIN_ANCHOR"
+    }
+    
+    # 全ノードにアンカートランザクションを送信（同期）
+    for node in nodes:
+        node.receive_message("NEW_TRANSACTION", anchor_payload, "加工工場")
+    
+    print("\n[On-chain] アンカー取引に対するPBFT合意形成プロセスを開始します...")
+    node_factory.propose_block()
+    
+    # 監査デモンストレーション
+    print("\n--- 監査 (Integrity Verification) デモ ---")
+    print("[Audit] 正常時のデータ整合性監査を実行します...")
+    node_factory.audit_offchain_data(record_id, offchain_store)
+    
+    print("\n[Audit] 悪意ある管理者によるオフチェーンDB（DuckDB）の直接改ざんをシミュレーションします...")
+    # 悪意あるユーザーまたはDB管理者が直接データベースの数値を書き換える
+    offchain_store.conn.execute(
+        "UPDATE manufacturing_details SET details = ? WHERE record_id = ?",
+        ('{"actual_temperature_log_c": [50.0, 50.2, 50.1, 50.0, 50.0], "operator": "改ざん者", "remarks": "異常データを隠蔽"}', record_id)
+    )
+    print("[Audit] DuckDBの加工記録を『75℃(正常)』から『50℃(低温・異常)』に隠蔽改ざんしました。")
+    
+    print("\n[Audit] 改ざん後のデータ整合性監査を実行します...")
+    node_factory.audit_offchain_data(record_id, offchain_store)
+    
+    # データベースクローズ
+    offchain_store.close()
+
     print("\n" + "=" * 60)
     print("  シミュレーション完了")
     print("=" * 60)
+

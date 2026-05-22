@@ -1,0 +1,1083 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PBFT Blockchain & DuckDB Hybrid Traceability Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=Space+Grotesk:wght@400;600&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --panel-bg: rgba(20, 28, 48, 0.6);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --primary: #6366f1;
+            --primary-hover: #4f46e5;
+            --primary-glow: rgba(99, 102, 241, 0.3);
+            --secondary: #a855f7;
+            --success: #10b981;
+            --danger: #ef4444;
+            --warning: #f59e0b;
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --font-main: 'Outfit', sans-serif;
+            --font-mono: 'JetBrains Mono', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            background-image: 
+                radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.12) 0px, transparent 50%),
+                radial-gradient(at 100% 100%, rgba(168, 85, 247, 0.12) 0px, transparent 50%);
+            background-attachment: fixed;
+            color: var(--text-main);
+            font-family: var(--font-main);
+            line-height: 1.5;
+            overflow-x: hidden;
+            padding-bottom: 60px;
+        }
+
+        .container {
+            max-width: 1440px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        /* ------------------------------------------
+           Header & Layout
+        ------------------------------------------ */
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 20px 32px;
+            background: var(--panel-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+        }
+
+        h1 {
+            font-size: 24px;
+            font-weight: 700;
+            background: linear-gradient(135deg, #fff 30%, #a855f7 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        h1 span {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--primary);
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            background: rgba(99, 102, 241, 0.1);
+            padding: 4px 10px;
+            border-radius: 20px;
+            border: 1px solid rgba(99, 102, 241, 0.2);
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .btn {
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: none;
+            font-family: var(--font-main);
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--primary), var(--secondary));
+            color: white;
+            box-shadow: 0 4px 14px var(--primary-glow);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(99, 102, 241, 0.4);
+        }
+
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+        }
+
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.1);
+            transform: translateY(-2px);
+        }
+
+        .btn-danger {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #f87171;
+        }
+
+        .btn-danger:hover {
+            background: rgba(239, 68, 68, 0.3);
+            transform: translateY(-2px);
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 3fr 1fr;
+            gap: 24px;
+        }
+
+        @media (max-width: 1024px) {
+            .dashboard-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* ------------------------------------------
+           Panels & Cards
+        ------------------------------------------ */
+        .panel {
+            background: var(--panel-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.2);
+        }
+
+        .panel-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 18px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            padding-bottom: 10px;
+        }
+
+        /* Node cards styling */
+        .nodes-container {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        @media (max-width: 768px) {
+            .nodes-container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .node-card {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            transition: all 0.3s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .node-card:hover {
+            border-color: rgba(99, 102, 241, 0.4);
+            transform: translateY(-2px);
+        }
+
+        .node-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 4px;
+            height: 100%;
+            background: var(--text-muted);
+        }
+
+        .node-card.leader::before {
+            background: linear-gradient(to bottom, var(--primary), var(--secondary));
+        }
+
+        .node-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .node-name {
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        .node-role {
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            padding: 2px 8px;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text-muted);
+        }
+
+        .node-card.leader .node-role {
+            background: rgba(168, 85, 247, 0.15);
+            color: #d8b4fe;
+            border: 1px solid rgba(168, 85, 247, 0.3);
+        }
+
+        .node-stat {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 13px;
+        }
+
+        .node-stat-label {
+            color: var(--text-muted);
+        }
+
+        .node-stat-value {
+            font-family: var(--font-mono);
+            font-weight: 600;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--success);
+            display: inline-block;
+            margin-right: 6px;
+            box-shadow: 0 0 8px var(--success);
+        }
+
+        /* ------------------------------------------
+           Interactive Forms & Tabs
+        ------------------------------------------ */
+        .tabs-header {
+            display: flex;
+            gap: 8px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-color);
+            padding: 4px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+
+        .tab-btn {
+            flex: 1;
+            padding: 8px 16px;
+            border-radius: 6px;
+            background: transparent;
+            border: none;
+            color: var(--text-muted);
+            font-family: var(--font-main);
+            font-weight: 600;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .tab-btn.active {
+            background: rgba(255, 255, 255, 0.08);
+            color: var(--text-main);
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            color: var(--text-muted);
+            margin-bottom: 6px;
+            letter-spacing: 0.5px;
+        }
+
+        .form-input {
+            width: 100%;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 10px 14px;
+            color: var(--text-main);
+            font-family: var(--font-main);
+            font-size: 14px;
+            transition: all 0.3s ease;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: var(--primary);
+            background: rgba(255, 255, 255, 0.06);
+            box-shadow: 0 0 10px rgba(99, 102, 241, 0.2);
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        /* ------------------------------------------
+           Blockchain Visualizer
+        ------------------------------------------ */
+        .blockchain-scroller {
+            display: flex;
+            gap: 20px;
+            overflow-x: auto;
+            padding: 12px 4px;
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+        }
+
+        .block-node {
+            flex: 0 0 280px;
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 18px;
+            position: relative;
+            transition: all 0.3s ease;
+        }
+
+        .block-node:hover {
+            border-color: rgba(168, 85, 247, 0.4);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+        }
+
+        .block-index {
+            position: absolute;
+            top: 18px;
+            right: 18px;
+            font-family: var(--font-mono);
+            font-weight: 700;
+            color: var(--secondary);
+            font-size: 20px;
+            opacity: 0.6;
+        }
+
+        .block-process {
+            font-weight: 600;
+            font-size: 15px;
+            margin-bottom: 8px;
+            padding-right: 32px;
+            color: #fff;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .block-hash {
+            font-family: var(--font-mono);
+            font-size: 11px;
+            color: var(--text-muted);
+            margin-bottom: 12px;
+            background: rgba(0, 0, 0, 0.2);
+            padding: 4px 8px;
+            border-radius: 4px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .block-data-preview {
+            font-size: 12px;
+            color: var(--text-muted);
+            border-top: 1px dashed rgba(255, 255, 255, 0.08);
+            padding-top: 8px;
+            max-height: 120px;
+            overflow-y: auto;
+        }
+
+        .block-arrow {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--text-muted);
+            font-size: 20px;
+        }
+
+        /* ------------------------------------------
+           Offchain Table & Audit Badges
+        ------------------------------------------ */
+        .table-container {
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+
+        th, td {
+            padding: 14px 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            font-size: 14px;
+        }
+
+        th {
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            font-size: 11px;
+            letter-spacing: 0.5px;
+        }
+
+        tr:hover td {
+            background: rgba(255, 255, 255, 0.01);
+        }
+
+        .audit-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        .audit-badge.unchecked {
+            background: rgba(255, 255, 255, 0.06);
+            color: var(--text-muted);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .audit-badge.success {
+            background: rgba(16, 185, 129, 0.15);
+            color: #34d399;
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.1);
+        }
+
+        .audit-badge.failed {
+            background: rgba(239, 68, 68, 0.15);
+            color: #f87171;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            box-shadow: 0 0 10px rgba(239, 68, 68, 0.1);
+        }
+
+        .action-cell {
+            display: flex;
+            gap: 8px;
+        }
+
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 12px;
+            border-radius: 6px;
+        }
+
+        /* ------------------------------------------
+           Terminal Consoles
+        ------------------------------------------ */
+        .terminal {
+            background: #050811;
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 16px;
+            font-family: var(--font-mono);
+            font-size: 12px;
+            color: #38bdf8;
+            height: 300px;
+            overflow-y: auto;
+            box-shadow: inset 0 4px 20px rgba(0, 0, 0, 0.5);
+            line-height: 1.6;
+        }
+
+        .terminal-line {
+            margin-bottom: 4px;
+            white-space: pre-wrap;
+        }
+
+        .terminal-line.info { color: #38bdf8; }
+        .terminal-line.success { color: #4ade80; }
+        .terminal-line.warn { color: #fbbf24; }
+        .terminal-line.danger { color: #f87171; }
+        .terminal-line.system { color: #c084fc; }
+
+        /* Floating Notifications */
+        .notification-container {
+            position: fixed;
+            bottom: 24px;
+            right: 24px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .notification {
+            background: rgba(20, 28, 48, 0.95);
+            backdrop-filter: blur(10px);
+            border: 1px solid var(--border-color);
+            padding: 16px 24px;
+            border-radius: 8px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+            color: #fff;
+            font-size: 14px;
+            min-width: 300px;
+            transform: translateX(120%);
+            transition: transform 0.3s cubic-bezier(0.68, -0.55, 0.265, 1.55);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .notification.show {
+            transform: translateX(0);
+        }
+
+        .notification.success { border-left: 4px solid var(--success); }
+        .notification.error { border-left: 4px solid var(--danger); }
+        .notification.info { border-left: 4px solid var(--primary); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Dashboard Header -->
+        <header>
+            <div>
+                <h1>PBFT Traceability <span>Hybrid Architecture</span></h1>
+                <p style="color: var(--text-muted); font-size: 13px; margin-top: 4px;">PBFT合意形成ブロックチェーン（オンチェーン） ＆ DuckDB分析ストレージ（オフチェーン）の連携</p>
+            </div>
+            <div class="header-actions">
+                <div style="font-size: 12px; color: var(--text-muted); display: flex; align-items: center;">
+                    <span class="status-dot"></span>ネットワーク接続中
+                </div>
+                <button class="btn btn-secondary btn-danger" onclick="resetState()">
+                    ステート初期化
+                </button>
+            </div>
+        </header>
+
+        <!-- Main Grid Layout -->
+        <div class="dashboard-grid">
+            <!-- Left Column: Nodes, Forms, Chain, DB -->
+            <div>
+                <!-- Node Cards -->
+                <div class="nodes-container" id="nodes-container">
+                    <!-- Dynamic rendering -->
+                </div>
+
+                <!-- Block Proposals / Mempool Status -->
+                <div class="panel">
+                    <div class="panel-title">
+                        <span>未承認トランザクションプール (Mempool)</span>
+                        <span id="mempool-count-badge" style="background: rgba(99, 102, 241, 0.15); color: var(--primary); font-size: 12px; padding: 2px 8px; border-radius: 12px;">0 件の未承認取引</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 16px;">
+                        <p style="color: var(--text-muted); font-size: 14px;">受信したトランザクションは署名検証後プールに蓄積されます。合意形成を開始すると、リーダーがブロック候補を提案しPBFT投票プロセスが走ります。</p>
+                        <button class="btn btn-primary" onclick="proposeBlock()">
+                            合意形成の実行 (Propose)
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Forms Tab Panel -->
+                <div class="panel">
+                    <div class="tabs-header">
+                        <button class="tab-btn active" onclick="switchTab('supplier-tab')">通常取引の登録 (オンチェーン単独)</button>
+                        <button class="tab-btn" onclick="switchTab('offchain-tab')">加工詳細ログ登録 (オフチェーン・ハイブリッド)</button>
+                    </div>
+
+                    <!-- Tab 1: Supplier Registration -->
+                    <div class="tab-content active" id="supplier-tab">
+                        <form onsubmit="submitTransaction(event)">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>送信元ノード (デジタル署名者)</label>
+                                    <select class="form-input" id="supplier-name">
+                                        <option value="納入業者">納入業者 (Replica)</option>
+                                        <option value="加工工場">加工工場 (Leader)</option>
+                                        <option value="倉庫">倉庫 (Replica)</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label>製品ロット番号 (Lot Number)</label>
+                                    <input type="text" class="form-input" id="lot-number" placeholder="RAW-A999" required>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>重量 (Weight - kg) <span style="color: var(--warning); text-transform: none; font-size: 10px;">※スマートコントラクトルール: 最低100kg以上</span></label>
+                                <input type="number" class="form-input" id="weight-kg" placeholder="500" required>
+                            </div>
+                            <button type="submit" class="btn btn-primary">トランザクションの作成 & 送信</button>
+                        </form>
+                    </div>
+
+                    <!-- Tab 2: Detailed Process Logs (Off-chain) -->
+                    <div class="tab-content" id="offchain-tab">
+                        <form onsubmit="submitOffchainAnchor(event)">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>レコードID (暗号アンカーID)</label>
+                                    <input type="text" class="form-input" id="off-record-id" placeholder="rec-factory-202605" required>
+                                </div>
+                                <div class="form-group">
+                                    <label>対象ロット番号 (Lot Number)</label>
+                                    <input type="text" class="form-input" id="off-lot-number" placeholder="RAW-A001" required>
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>工程名 (Process Name)</label>
+                                    <input type="text" class="form-input" id="off-process" value="詳細加熱加工ログ" required>
+                                </div>
+                                <div class="form-group">
+                                    <label>担当オペレーター</label>
+                                    <input type="text" class="form-input" id="off-operator" placeholder="山田 太郎" required>
+                                </div>
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>設定目標温度 (℃)</label>
+                                    <input type="number" step="0.1" class="form-input" id="off-target-temp" placeholder="75.0" required>
+                                </div>
+                                <div class="form-group">
+                                    <label>実測温度ログ (コンマ区切り数字リスト)</label>
+                                    <input type="text" class="form-input" id="off-temp-log" placeholder="74.5, 74.8, 75.1, 75.0, 74.9" required>
+                                </div>
+                            </div>
+                            <button type="submit" class="btn btn-primary">オフチェーンDB保存 & オンチェーンへのアンカリング</button>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- On-chain Blockchain explorer -->
+                <div class="panel">
+                    <div class="panel-title">オンチェーン・ブロックチェーン (合意済み共有台帳)</div>
+                    <div class="blockchain-scroller" id="blockchain-scroller">
+                        <!-- Dynamic blocks rendering -->
+                    </div>
+                </div>
+
+                <!-- Off-chain DuckDB explorer -->
+                <div class="panel">
+                    <div class="panel-title">オフチェーン・時系列詳細データベース (DuckDB)</div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>レコードID</th>
+                                    <th>ロット番号</th>
+                                    <th>工程名</th>
+                                    <th>オペレーター / 詳細</th>
+                                    <th>整合性監査 (Audit)</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="offchain-table-body">
+                                <!-- Dynamic rows -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column: Live Terminal Output -->
+            <div>
+                <div class="panel" style="position: sticky; top: 24px; height: calc(100vh - 150px); display: flex; flex-direction: column;">
+                    <div class="panel-title">
+                        <span>リアルタイムコンソールログ</span>
+                        <button class="btn btn-secondary btn-sm" onclick="clearConsole()">クリア</button>
+                    </div>
+                    <div style="font-size: 13px; color: var(--text-muted); margin-bottom: 12px;">各ノードのPBFT投票メッセージやシステム監査の出力がここに表示されます。</div>
+                    <div class="terminal" id="terminal-log" style="flex-grow: 1;">
+                        <!-- Dynamic log lines -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification Toast Area -->
+    <div class="notification-container" id="notification-container"></div>
+
+    <!-- JavaScript logic -->
+    <script>
+        // Store verification status of off-chain records locally
+        const auditStatuses = {}; // { record_id: { status: 'unchecked'|'success'|'failed', onchain_hash: '', offchain_hash: '' } }
+
+        function showNotification(message, type = 'info') {
+            const container = document.getElementById('notification-container');
+            const toast = document.createElement('div');
+            toast.className = `notification ${type}`;
+            toast.innerHTML = `
+                <span>${message}</span>
+                <span style="margin-left: 16px; cursor: pointer; opacity: 0.7;" onclick="this.parentElement.remove()">✕</span>
+            `;
+            container.appendChild(toast);
+            
+            // Trigger animation
+            setTimeout(() => toast.classList.add('show'), 50);
+            
+            // Remove after 4s
+            setTimeout(() => {
+                toast.classList.remove('show');
+                setTimeout(() => toast.remove(), 300);
+            }, 4000);
+        }
+
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            
+            // Find the trigger button
+            const activeBtn = Array.from(document.querySelectorAll('.tab-btn')).find(btn => 
+                btn.getAttribute('onclick').includes(tabId)
+            );
+            if (activeBtn) activeBtn.classList.add('active');
+            
+            document.getElementById(tabId).classList.add('active');
+        }
+
+        function clearConsole() {
+            document.getElementById('terminal-log').innerHTML = '<div class="terminal-line system">[System] Console logs cleared.</div>';
+        }
+
+        // ------------------------------------------
+        // REST API Calls
+        // ------------------------------------------
+        async function fetchState() {
+            try {
+                const response = await fetch('/api/state');
+                const data = await response.json();
+                
+                renderNodes(data.nodes);
+                renderBlockchain(data.blockchain);
+                renderOffchain(data.offchain);
+                renderLogs(data.logs);
+            } catch (err) {
+                console.error("Error fetching states:", err);
+            }
+        }
+
+        function renderNodes(nodes) {
+            const container = document.getElementById('nodes-container');
+            let pendingSum = 0;
+            container.innerHTML = nodes.map(node => {
+                pendingSum += node.pending_tx_count;
+                const isLeader = node.role === 'Leader';
+                return `
+                    <div class="node-card ${isLeader ? 'leader' : ''}">
+                        <div class="node-header">
+                            <span class="node-name">${node.node_id}</span>
+                            <span class="node-role">${node.role}</span>
+                        </div>
+                        <div class="node-stat">
+                            <span class="node-stat-label">台帳チェーン高</span>
+                            <span class="node-stat-value">${node.chain_height}</span>
+                        </div>
+                        <div class="node-stat">
+                            <span class="node-stat-label">未承認プール</span>
+                            <span class="node-stat-value">${node.pending_tx_count} 件</span>
+                        </div>
+                        <div class="node-stat">
+                            <span class="node-stat-label">最新ブロックハッシュ</span>
+                            <span class="node-stat-value" title="${node.latest_hash}">${node.latest_hash.substring(0, 10)}...</span>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            
+            document.getElementById('mempool-count-badge').textContent = `${pendingSum} 件の未承認取引`;
+        }
+
+        function renderBlockchain(blocks) {
+            const scroller = document.getElementById('blockchain-scroller');
+            scroller.innerHTML = blocks.map((block, idx) => {
+                let dataStr = "";
+                if (typeof block.data === 'string') {
+                    dataStr = block.data;
+                } else {
+                    dataStr = JSON.stringify(block.data, null, 2);
+                }
+                
+                return `
+                    <div class="block-node">
+                        <span class="block-index">#${block.index}</span>
+                        <div class="block-process">${block.process_name}</div>
+                        <div class="block-hash" title="Current Hash: ${block.hash}">Hash: ${block.hash.substring(0, 16)}...</div>
+                        <div class="block-hash" title="Previous Hash: ${block.previous_hash}">Prev: ${block.previous_hash.substring(0, 16)}...</div>
+                        <div class="block-data-preview">
+                            <pre style="font-family: var(--font-mono); font-size: 11px; white-space: pre-wrap; word-break: break-all;">${dataStr}</pre>
+                        </div>
+                    </div>
+                    ${idx < blocks.length - 1 ? '<div class="block-arrow">➜</div>' : ''}
+                `;
+            }).join('');
+        }
+
+        function renderOffchain(records) {
+            const tbody = document.getElementById('offchain-table-body');
+            if (records.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="6" style="text-align: center; color: var(--text-muted);">オフチェーン(DuckDB)にはまだ時系列詳細データが登録されていません。</td></tr>`;
+                return;
+            }
+
+            tbody.innerHTML = records.map(rec => {
+                const auditState = auditStatuses[rec.record_id] || { status: 'unchecked', onchain_hash: '', offchain_hash: '' };
+                
+                let badgeHtml = '';
+                if (auditState.status === 'unchecked') {
+                    badgeHtml = `<span class="audit-badge unchecked">❔ 未監査</span>`;
+                } else if (auditState.status === 'success') {
+                    badgeHtml = `
+                        <span class="audit-badge success" title="ハッシュ一致: ${auditState.onchain_hash}">
+                            ✅ 監査成功
+                        </span>
+                    `;
+                } else {
+                    badgeHtml = `
+                        <span class="audit-badge failed" title="オンチェーン: ${auditState.onchain_hash}&#10;オフチェーン: ${auditState.offchain_hash}">
+                            ❌ 改ざん検知！
+                        </span>
+                    `;
+                }
+
+                // Make details readable
+                const detailsStr = typeof rec.details === 'object' ? JSON.stringify(rec.details) : rec.details;
+
+                return `
+                    <tr>
+                        <td style="font-family: var(--font-mono); font-weight: 600;">${rec.record_id}</td>
+                        <td style="font-family: var(--font-mono);">${rec.lot_number}</td>
+                        <td>${rec.process_name}</td>
+                        <td>
+                            <div style="font-size: 12px; color: var(--text-muted); max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title='${detailsStr}'>
+                                ${detailsStr}
+                            </div>
+                            <div style="font-size: 10px; color: rgba(255,255,255,0.3); margin-top: 2px;">登録日時: ${rec.timestamp}</div>
+                        </td>
+                        <td>${badgeHtml}</td>
+                        <td class="action-cell">
+                            <button class="btn btn-secondary btn-sm" onclick="auditRecord('${rec.record_id}')">
+                                監査
+                            </button>
+                            <button class="btn btn-secondary btn-danger btn-sm" onclick="tamperRecord('${rec.record_id}')">
+                                改ざん
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
+        // Cache last logs size to prevent excessive DOM updates
+        let lastLogsCount = 0;
+
+        function renderLogs(logs) {
+            const terminal = document.getElementById('terminal-log');
+            if (logs.length === lastLogsCount) return;
+            
+            terminal.innerHTML = logs.map(line => {
+                let cssClass = 'info';
+                if (line.includes('★ブロック確定')) cssClass = 'success';
+                else if (line.includes('【監査成功】')) cssClass = 'success';
+                else if (line.includes('【警告】') || line.includes('【監査警告】')) cssClass = 'danger';
+                else if (line.includes('改ざん')) cssClass = 'danger';
+                else if (line.includes('ブロードキャスト送信')) cssClass = 'warn';
+                else if (line.includes('[API]')) cssClass = 'system';
+                
+                return `<div class="terminal-line ${cssClass}">${line}</div>`;
+            }).join('');
+            
+            lastLogsCount = logs.length;
+            // Scroll to bottom
+            terminal.scrollTop = terminal.scrollHeight;
+        }
+
+        async function submitTransaction(event) {
+            event.preventDefault();
+            const supplier = document.getElementById('supplier-name').value;
+            const lotNumber = document.getElementById('lot-number').value;
+            const weightKg = document.getElementById('weight-kg').value;
+
+            try {
+                const response = await fetch('/api/transaction', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ supplier, lot_number: lotNumber, weight_kg: parseInt(weightKg) })
+                });
+                
+                if (response.ok) {
+                    showNotification('ロット登録トランザクションを送信しました。未承認プールを確認してください。', 'success');
+                    document.getElementById('lot-number').value = '';
+                    document.getElementById('weight-kg').value = '';
+                    fetchState();
+                } else {
+                    const data = await response.json();
+                    showNotification(`エラー: ${data.error || '送信に失敗しました'}`, 'error');
+                }
+            } catch (err) {
+                showNotification('接続エラーが発生しました。', 'error');
+            }
+        }
+
+        async function proposeBlock() {
+            try {
+                const response = await fetch('/api/propose', { method: 'POST' });
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showNotification(`PBFTブロック合意が完了しました！ (ブロックHash: ${data.block_hash.substring(0, 16)}...)`, 'success');
+                    fetchState();
+                } else {
+                    showNotification(`提案失敗: ${data.error}`, 'error');
+                }
+            } catch (err) {
+                showNotification('提案処理中に接続エラーが発生しました。', 'error');
+            }
+        }
+
+        async function submitOffchainAnchor(event) {
+            event.preventDefault();
+            const record_id = document.getElementById('off-record-id').value;
+            const lot_number = document.getElementById('off-lot-number').value;
+            const process_name = document.getElementById('off-process').value;
+            const operator = document.getElementById('off-operator').value;
+            const target_temp = parseFloat(document.getElementById('off-target-temp').value);
+            const temp_list = document.getElementById('off-temp-log').value
+                .split(',')
+                .map(n => parseFloat(n.trim()))
+                .filter(n => !isNaN(n));
+
+            const details = {
+                operator,
+                target_temperature_c: target_temp,
+                actual_temperature_log_c: temp_list,
+                remarks: "加熱処理工程の完了。"
+            };
+
+            try {
+                const response = await fetch('/api/anchor', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ record_id, lot_number, process_name, details })
+                });
+
+                if (response.ok) {
+                    showNotification('オフチェーン詳細データを保存し、オンチェーンハッシュを送信しました。合意形成を実行してください。', 'success');
+                    // Reset inputs
+                    document.getElementById('off-record-id').value = '';
+                    document.getElementById('off-lot-number').value = '';
+                    fetchState();
+                } else {
+                    const data = await response.json();
+                    showNotification(`アンカーエラー: ${data.error}`, 'error');
+                }
+            } catch (err) {
+                showNotification('接続エラーが発生しました。', 'error');
+            }
+        }
+
+        async function auditRecord(record_id) {
+            try {
+                const response = await fetch('/api/audit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ record_id })
+                });
+                const data = await response.json();
+                
+                if (data.valid) {
+                    auditStatuses[record_id] = {
+                        status: 'success',
+                        onchain_hash: data.onchain_hash,
+                        offchain_hash: data.offchain_hash
+                    };
+                    showNotification(`監査成功: レコード ${record_id} の整合性がオンチェーンハッシュと一致しました！`, 'success');
+                } else {
+                    auditStatuses[record_id] = {
+                        status: 'failed',
+                        onchain_hash: data.onchain_hash,
+                        offchain_hash: data.offchain_hash
+                    };
+                    showNotification(`警告！ レコード ${record_id} の改ざんが検知されました！`, 'error');
+                }
+                fetchState();
+            } catch (err) {
+                showNotification('監査クエリの送信に失敗しました。', 'error');
+            }
+        }
+
+        async function tamperRecord(record_id) {
+            try {
+                const response = await fetch('/api/tamper', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ record_id })
+                });
+                
+                if (response.ok) {
+                    showNotification(`レコード ${record_id} に対するオフチェーン（DuckDB）改ざん命令を実行しました。`, 'info');
+                    fetchState();
+                } else {
+                    showNotification('改ざん処理に失敗しました。', 'error');
+                }
+            } catch (err) {
+                showNotification('接続エラーが発生しました。', 'error');
+            }
+        }
+
+        async function resetState() {
+            if (!confirm('システムの状態を初期化（すべてのブロックチェーンとDBデータを消去）しますか？')) return;
+            
+            try {
+                const response = await fetch('/api/reset', { method: 'POST' });
+                if (response.ok) {
+                    // Reset local status caches
+                    for (let key in auditStatuses) delete auditStatuses[key];
+                    showNotification('システムを初期化しました。', 'success');
+                    fetchState();
+                }
+            } catch (err) {
+                showNotification('初期化エラーが発生しました。', 'error');
+            }
+        }
+
+        // Initialize state fetching & set interval
+        fetchState();
+        setInterval(fetchState, 1500);
+    </script>
+</body>
+</html>

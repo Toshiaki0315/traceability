@@ -581,5 +581,102 @@ class TestOffChainOnChainIntegration(unittest.TestCase):
         is_valid_after_tamper = self.node_leader.audit_offchain_data(record_id, self.offchain_store)
         self.assertFalse(is_valid_after_tamper)
 
+class TestFlaskWebUI(unittest.TestCase):
+    """ステップ9: Flask Web UI HTTP API のテスト"""
+
+    def setUp(self):
+        # app.py から Flask app をインポートしてテストクライアントを作成
+        # （TDD Redフェーズ時はapp.pyが未作成のためImportErrorになることを意図）
+        from app import app, init_demo_state
+        self.app = app
+        self.client = self.app.test_client()
+        # 各テストの前にステートをリセット/初期化する
+        init_demo_state()
+
+    def test_get_state(self):
+        """/api/state がネットワーク、ブロックチェーン、オフチェーン、およびログを正しく返却すること"""
+        response = self.client.get('/api/state')
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.data.decode('utf-8'))
+        
+        # 期待するキーが存在すること
+        self.assertIn("nodes", data)
+        self.assertIn("blockchain", data)
+        self.assertIn("offchain", data)
+        self.assertIn("logs", data)
+        
+        # 3ノードが存在すること
+        self.assertEqual(len(data["nodes"]), 3)
+        # 初期ブロックチェーンが存在すること（ジェネシスブロックのみで長さ1）
+        self.assertEqual(len(data["blockchain"]), 1)
+        self.assertEqual(data["blockchain"][0]["process_name"], "System Initialization")
+
+    def test_post_transaction_and_propose(self):
+        """取引登録APIを呼び出し、ブロック提案APIでPBFT合意形成がなされること"""
+        # 1. 新しいロットの取引登録
+        payload = {
+            "supplier": "A社",
+            "lot_number": "LOT-UI-001",
+            "weight_kg": 250
+        }
+        res_tx = self.client.post('/api/transaction', json=payload)
+        self.assertEqual(res_tx.status_code, 200)
+        data_tx = json.loads(res_tx.data.decode('utf-8'))
+        self.assertTrue(data_tx["success"])
+
+        # 2. 状態の確認（未承認プールに1件存在するはず）
+        res_state = self.client.get('/api/state')
+        data_state = json.loads(res_state.data.decode('utf-8'))
+        # 加工工場（リーダー）の未承認プール数が1であること
+        factory_node = next(n for n in data_state["nodes"] if n["node_id"] == "加工工場")
+        self.assertEqual(factory_node["pending_tx_count"], 1)
+
+        # 3. ブロック提案を実行
+        res_propose = self.client.post('/api/propose')
+        self.assertEqual(res_propose.status_code, 200)
+        data_propose = json.loads(res_propose.data.decode('utf-8'))
+        self.assertTrue(data_propose["success"])
+
+        # 4. 合意後のチェーンサイズが2になることを確認
+        res_state2 = self.client.get('/api/state')
+        data_state2 = json.loads(res_state2.data.decode('utf-8'))
+        self.assertEqual(len(data_state2["blockchain"]), 2)
+        # ブロックの中身にUIで登録したlot_numberが含まれていること
+        latest_block = data_state2["blockchain"][-1]
+        self.assertEqual(latest_block["data"][0]["data"]["lot_number"], "LOT-UI-001")
+
+    def test_anchor_audit_and_tamper_flow(self):
+        """詳細ログのアンカリング、監査の成功、改ざんシミュレーション、および監査不合格の流れをテスト"""
+        # 1. 詳細ログのオフチェーン保存とオンチェーンへのアンカリング
+        anchor_payload = {
+            "record_id": "rec-ui-999",
+            "lot_number": "LOT-UI-999",
+            "process_name": "UI詳細加熱",
+            "details": {"temp": 82.5, "operator": "Bob"}
+        }
+        res_anchor = self.client.post('/api/anchor', json=anchor_payload)
+        self.assertEqual(res_anchor.status_code, 200)
+        
+        # アンカーをブロックに確定させるため、PBFT合意を実行
+        self.client.post('/api/propose')
+
+        # 2. 正常時の監査検証
+        res_audit = self.client.post('/api/audit', json={"record_id": "rec-ui-999"})
+        self.assertEqual(res_audit.status_code, 200)
+        data_audit = json.loads(res_audit.data.decode('utf-8'))
+        self.assertTrue(data_audit["valid"])
+
+        # 3. 改ざんシミュレーションの実行
+        res_tamper = self.client.post('/api/tamper', json={"record_id": "rec-ui-999"})
+        self.assertEqual(res_tamper.status_code, 200)
+        data_tamper = json.loads(res_tamper.data.decode('utf-8'))
+        self.assertTrue(data_tamper["success"])
+
+        # 4. 改ざん後の監査検証（失敗検知）
+        res_audit_post = self.client.post('/api/audit', json={"record_id": "rec-ui-999"})
+        self.assertEqual(res_audit_post.status_code, 200)
+        data_audit_post = json.loads(res_audit_post.data.decode('utf-8'))
+        self.assertFalse(data_audit_post["valid"])
+
 if __name__ == '__main__':
     unittest.main()

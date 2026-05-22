@@ -87,9 +87,9 @@
 - **Python 3.7以上** がインストールされていること。
 
 ### 必要なライブラリのインストール
-電子署名とオフチェーンデータベース機能を利用するため、`rsa` および `duckdb` が必要です。以下のコマンドでインストールしてください。
+電子署名とオフチェーンデータベース機能、およびWeb UIを利用するため、`rsa`、`duckdb`、`flask` が必要です。以下のコマンドでインストールしてください。
 ```bash
-pip install rsa duckdb
+pip install rsa duckdb flask
 ```
 
 ## 実行方法
@@ -99,6 +99,26 @@ pip install rsa duckdb
 ```bash
 python traceability.py
 ```
+
+### Web UI ダッシュボードの起動（ステップ9）
+Flask Web サーバーを起動することで、ブラウザからPBFTネットワークの状態確認、トランザクション送信、オフチェーン監査デモをインタラクティブに体験できます。
+
+```bash
+python app.py
+```
+
+起動後、ブラウザで以下にアクセスしてください：
+```
+http://127.0.0.1:5000
+```
+
+#### Web UIでできること
+- **ノードモニタリング**: 全ノード（納入業者・加工工場・倉庫）のリアルタイム状態確認
+- **通常トランザクション登録**: ロット情報をフォームから送信し、PBFTブロックへ合意確定
+- **ハイブリッド連携デモ**: 詳細な加工ログをDuckDB（オフチェーン）へ保存し、ハッシュをPBFTチェーン（オンチェーン）へアンカリング
+- **整合性監査**: 「監査」ボタンでオンチェーン・オフチェーンのハッシュを照合（緑：正常 / 赤：改ざん検知）
+- **改ざんシミュレーション**: 「改ざん」ボタンでDuckDBデータを直接書き換えた後、監査で警告が表示されることを体験
+- **リアルタイムコンソール**: PBFTのPRE_PREPARE/PREPARE/COMMITメッセージを画面右側のターミナルで可視化
 
 ### テストの実行
 ```bash
@@ -118,5 +138,7 @@ python -m unittest test_traceability.py
 | ファイル | 説明 |
 |---|---|
 | `traceability.py` | プロダクトコード（Block, TraceabilityChain, Node クラスとPBFTロジック） |
-| `test_traceability.py` | ユニットテスト（署名検証, ネットワーク通信, トランザクション分離, PBFT合意形成） |
+| `app.py` | Flask Web サーバー（REST API + ダッシュボード配信） |
+| `templates/index.html` | Web UI ダッシュボード（HTML/CSS/JS シングルページアプリ） |
+| `test_traceability.py` | ユニットテスト（署名検証, ネットワーク通信, トランザクション分離, PBFT合意形成, Flask API統合テスト） |
 | `README.md` | 本ドキュメント |

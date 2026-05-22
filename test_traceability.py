@@ -678,5 +678,141 @@ class TestFlaskWebUI(unittest.TestCase):
         data_audit_post = json.loads(res_audit_post.data.decode('utf-8'))
         self.assertFalse(data_audit_post["valid"])
 
+class TestNodeWebAPI(unittest.TestCase):
+    """ステップ10: 各ノード独立プロセス相当の HTTP/REST API 統合テスト"""
+
+    @classmethod
+    def setUpClass(cls):
+        import sys
+        import threading
+        import time
+        import uvicorn
+        from api import create_node_app
+        from traceability import Node, default_weight_check_rule, OffChainStore
+
+        # Flask UI テスト後などで stdout が差し替えられている場合に復元
+        if hasattr(sys.stdout, "terminal"):
+            sys.stdout = sys.stdout.terminal
+
+        cls.offchain = OffChainStore(db_path=":memory:")
+        cls.ports = [59101, 59102, 59103]
+        cls.nodes = [
+            Node("納入業者", "Replica"),
+            Node("加工工場", "Leader"),
+            Node("倉庫", "Replica"),
+        ]
+        urls = [f"http://127.0.0.1:{p}" for p in cls.ports]
+        for i, node in enumerate(cls.nodes):
+            node.set_peer_urls([u for j, u in enumerate(urls) if j != i])
+            node.add_business_rule(default_weight_check_rule)
+
+        cls._threads = []
+        for node, port in zip(cls.nodes, cls.ports):
+            store = cls.offchain if node.role == "Leader" else None
+            app = create_node_app(node, store)
+
+            def _run(application, listen_port):
+                uvicorn.run(application, host="127.0.0.1", port=listen_port, log_level="error")
+
+            t = threading.Thread(target=_run, args=(app, port), daemon=True)
+            t.start()
+            cls._threads.append(t)
+        time.sleep(1.5)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.offchain.close()
+
+    def setUp(self):
+        """テスト間で台帳・PBFT状態をリセットする"""
+        from traceability import TraceabilityChain
+        for node in self.nodes:
+            node.chain = TraceabilityChain()
+            node.pending_transactions = []
+            node.prepares = {}
+            node.commits = {}
+
+    def test_node_info_endpoint(self):
+        import requests
+        r = requests.get(f"http://127.0.0.1:{self.ports[1]}/node", timeout=5)
+        self.assertEqual(r.status_code, 200)
+        data = r.json()
+        self.assertEqual(data["node_id"], "加工工場")
+        self.assertEqual(data["role"], "Leader")
+
+    def test_http_transaction_propose_and_chain(self):
+        """HTTP経由でトランザクション送信→ブロック提案→全ノードのチェーン一致を確認"""
+        import requests
+        from traceability import sign_data, encode_payload
+
+        supplier = self.nodes[0]
+        tx_data = {"lot_number": "LOT-HTTP-001", "supplier": "納入業者", "weight_kg": 300}
+        payload = encode_payload({
+            "data": tx_data,
+            "signature": sign_data(tx_data, supplier.private_key),
+            "public_key": supplier.public_key,
+        })
+
+        res_tx = requests.post(
+            f"http://127.0.0.1:{self.ports[0]}/transaction",
+            json={"transaction": payload, "sender_id": "納入業者"},
+            timeout=5,
+        )
+        self.assertEqual(res_tx.status_code, 200)
+
+        res_propose = requests.post(
+            f"http://127.0.0.1:{self.ports[1]}/propose",
+            timeout=10,
+        )
+        self.assertEqual(res_propose.status_code, 200)
+        self.assertEqual(res_propose.json()["status"], "proposed")
+
+        hashes = []
+        for port in self.ports:
+            res_chain = requests.get(f"http://127.0.0.1:{port}/chain", timeout=5)
+            self.assertEqual(res_chain.status_code, 200)
+            chain = res_chain.json()
+            self.assertEqual(len(chain), 2)
+            hashes.append(chain[-1]["hash"])
+
+        self.assertEqual(len(set(hashes)), 1)
+
+    def test_replica_cannot_propose(self):
+        import requests
+        res = requests.post(f"http://127.0.0.1:{self.ports[0]}/propose", timeout=5)
+        self.assertEqual(res.status_code, 403)
+
+    def test_http_audit_endpoint(self):
+        """HTTP /audit でオフチェーン整合性を検証できること"""
+        import requests
+        from traceability import sign_data, encode_payload
+
+        record_id = "rec-http-audit"
+        offchain_hash = self.offchain.save_record(
+            record_id, "LOT-AUDIT", "加熱", {"temp": 70.0}
+        )
+        leader = self.nodes[1]
+        anchor_data = {"record_id": record_id, "hash": offchain_hash, "lot_number": "LOT-AUDIT"}
+        anchor_payload = encode_payload({
+            "data": anchor_data,
+            "signature": sign_data(anchor_data, leader.private_key),
+            "public_key": leader.public_key,
+            "type": "OFFCHAIN_ANCHOR",
+        })
+        requests.post(
+            f"http://127.0.0.1:{self.ports[1]}/transaction",
+            json={"transaction": anchor_payload, "sender_id": "加工工場"},
+            timeout=5,
+        )
+        requests.post(f"http://127.0.0.1:{self.ports[1]}/propose", timeout=10)
+
+        res = requests.post(
+            f"http://127.0.0.1:{self.ports[1]}/audit",
+            json={"record_id": record_id},
+            timeout=5,
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(res.json()["integrity"])
+
 if __name__ == '__main__':
     unittest.main()

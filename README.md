@@ -100,6 +100,51 @@ pip install rsa duckdb flask
 python traceability.py
 ```
 
+### ノード REST API の起動（ステップ10）
+
+各参加者ノードを**独立したプロセス・ポート**で起動し、ノード間通信を HTTP/REST に切り替えます。
+
+```bash
+pip install -r requirements.txt
+chmod +x scripts/start_nodes.sh
+./scripts/start_nodes.sh
+```
+
+| ノード | 役割 | URL |
+|---|---|---|
+| 納入業者 | Replica | http://127.0.0.1:5001 |
+| 加工工場 | Leader | http://127.0.0.1:5002 |
+| 倉庫 | Replica | http://127.0.0.1:5003 |
+
+#### 主な API エンドポイント
+
+| メソッド | パス | 説明 |
+|---|---|---|
+| `GET` | `/node` | ノード状態（役割・チェーン高さ・未承認TX数） |
+| `GET` | `/chain` | 台帳（ブロックチェーン）の照会 |
+| `POST` | `/transaction` | トランザクション送信（全ピアへHTTPブロードキャスト） |
+| `POST` | `/propose` | ブロック提案（Leader のみ） |
+| `POST` | `/audit` | オフチェーン整合性監査 |
+| `POST` | `/pbft/pre_prepare` 等 | PBFT フェーズメッセージ（ノード間自動通信） |
+
+#### 利用例
+
+```bash
+# 台帳照会
+curl -s http://127.0.0.1:5002/chain | python -m json.tool
+
+# トランザクション送信・ブロック提案は traceability.py 内の鍵で署名した JSON が必要です。
+# 詳細は test_traceability.py の TestNodeWebAPI を参照してください。
+```
+
+単一ノードのみ起動する場合:
+
+```bash
+NODE_ID=加工工場 NODE_ROLE=Leader PORT=5002 \
+  PEER_URLS=http://127.0.0.1:5001,http://127.0.0.1:5003 \
+  python api.py
+```
+
 ### Web UI ダッシュボードの起動（ステップ9）
 Flask Web サーバーを起動することで、ブラウザからPBFTネットワークの状態確認、トランザクション送信、オフチェーン監査デモをインタラクティブに体験できます。
 
@@ -138,6 +183,8 @@ python -m unittest test_traceability.py
 | ファイル | 説明 |
 |---|---|
 | `traceability.py` | プロダクトコード（Block, TraceabilityChain, Node クラスとPBFTロジック） |
+| `api.py` | FastAPI ノード REST API（各ノードを独立プロセスで起動、ステップ10） |
+| `scripts/start_nodes.sh` | 3ノード API サーバー一括起動スクリプト |
 | `app.py` | Flask Web サーバー（REST API + ダッシュボード配信） |
 | `templates/index.html` | Web UI ダッシュボード（HTML/CSS/JS シングルページアプリ） |
 | `test_traceability.py` | ユニットテスト（署名検証, ネットワーク通信, トランザクション分離, PBFT合意形成, Flask API統合テスト） |

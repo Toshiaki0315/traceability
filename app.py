@@ -26,6 +26,9 @@ class DualStdout:
     def flush(self):
         self.terminal.flush()
 
+    def isatty(self):
+        return self.terminal.isatty()
+
 # stdout をリダイレクトして Web 画面のコンソールログに流せるようにする
 dual_stdout = DualStdout()
 sys.stdout = dual_stdout

@@ -1,9 +1,24 @@
+import base64
 import hashlib
 import json
 import os
 import time
 import rsa
 import duckdb
+
+# HTTPブロードキャスト用のエンドポイントマッピング（ステップ10）
+HTTP_BROADCAST_ROUTES = {
+    "NEW_TRANSACTION": "/transaction",
+    "PRE_PREPARE": "/pbft/pre_prepare",
+    "PREPARE": "/pbft/prepare",
+    "COMMIT": "/pbft/commit",
+}
+
+PBFT_ROUTE_TO_MSG = {
+    "pre_prepare": "PRE_PREPARE",
+    "prepare": "PREPARE",
+    "commit": "COMMIT",
+}
 
 # ==========================================
 # オフチェーンデータベース管理 (ステップ8)
@@ -87,6 +102,79 @@ def verify_signature(data, signature, public_key):
         return True
     except rsa.VerificationError:
         return False
+
+
+# ==========================================
+# HTTP/JSON シリアライズ（ステップ10）
+# ==========================================
+def encode_payload(payload: dict) -> dict:
+    """トランザクションペイロードをJSON送信用に変換する（署名・公開鍵をBase64化）"""
+    result = dict(payload)
+    sig = result.get("signature")
+    if isinstance(sig, bytes):
+        result["signature"] = base64.b64encode(sig).decode("ascii")
+    pub = result.get("public_key")
+    if hasattr(pub, "save_pkcs1"):
+        result["public_key"] = base64.b64encode(pub.save_pkcs1()).decode("ascii")
+    return result
+
+
+def decode_payload(payload: dict) -> dict:
+    """JSONから受信したペイロードを検証用の型に復元する"""
+    result = dict(payload)
+    sig = result.get("signature")
+    if isinstance(sig, str):
+        result["signature"] = base64.b64decode(sig)
+    pub = result.get("public_key")
+    if isinstance(pub, str):
+        result["public_key"] = rsa.PublicKey.load_pkcs1(base64.b64decode(pub))
+    return result
+
+
+def block_to_dict(block: "Block") -> dict:
+    """BlockオブジェクトをJSON送信用の辞書に変換する"""
+    data = block.data
+    if isinstance(data, list):
+        data = [encode_payload(tx) if isinstance(tx, dict) and "signature" in tx else tx for tx in data]
+    return {
+        "index": block.index,
+        "timestamp": block.timestamp,
+        "process_name": block.process_name,
+        "data": data,
+        "previous_hash": block.previous_hash,
+        "hash": block.hash,
+    }
+
+
+def dict_to_block(block_dict: dict) -> "Block":
+    """JSON辞書からBlockオブジェクトを復元する"""
+    data = block_dict["data"]
+    if isinstance(data, list):
+        data = [
+            decode_payload(tx) if isinstance(tx, dict) and "signature" in tx else tx
+            for tx in data
+        ]
+    block = Block(
+        index=block_dict["index"],
+        timestamp=block_dict["timestamp"],
+        process_name=block_dict["process_name"],
+        data=data,
+        previous_hash=block_dict["previous_hash"],
+    )
+    if block.hash != block_dict["hash"]:
+        raise ValueError("ブロックハッシュが一致しません。データが改ざんされている可能性があります。")
+    return block
+
+
+def default_weight_check_rule(payload):
+    """原料重量が100kg以上であることを検証するデフォルトビジネスルール"""
+    if payload.get("type") == "OFFCHAIN_ANCHOR":
+        return True
+    data = payload.get("data", {})
+    weight = data.get("weight_kg", 0)
+    if weight < 100:
+        raise ValueError(f"原料重量({weight}kg)が少なすぎます。最低100kg必要です。")
+    return True
 
 
 # ==========================================
@@ -237,12 +325,15 @@ class Node:
         self.public_key, self.private_key = generate_keypair()
         self.chain = TraceabilityChain()
         self.peers = []
-        self.pending_transactions = []  # 未承認トランザクションのリスト
-
-        # PBFTの投票管理用
+        self.peer_urls = []  # ピアノードのベースURL（例: ['http://127.0.0.1:5002']）
+        self.pending_transactions = []
         self.prepares = {}  # {block_hash: set(node_ids)}
         self.commits = {}   # {block_hash: set(node_ids)}
         self.business_rules = []
+
+    def set_peer_urls(self, urls: list[str]):
+        """ノード起動時にピアURLリストを設定する（ステップ10）"""
+        self.peer_urls = urls
 
     def add_peer(self, node):
         """P2Pネットワークのピア（通信相手）を登録する"""
@@ -319,11 +410,39 @@ class Node:
             return False
 
 
+
     def broadcast(self, msg_type, payload):
-        """登録された全ピアに対してメッセージを送信（ブロードキャスト）する"""
-        print(f"[{self.node_id}] ブロードキャスト送信: {msg_type}")
-        for peer in self.peers:
-            peer.receive_message(msg_type, payload, self.node_id)
+        """全ピアへメッセージをブロードキャストする。
+        peer_urls が設定されている場合は HTTP/REST、未設定の場合はインメモリ呼び出し。
+        """
+        if self.peer_urls:
+            import requests
+            route = HTTP_BROADCAST_ROUTES.get(msg_type)
+            if not route:
+                print(f"[WARN] 未知のメッセージタイプ: {msg_type}")
+                return
+            for url in self.peer_urls:
+                full_url = f"{url.rstrip('/')}{route}"
+                try:
+                    if msg_type == "NEW_TRANSACTION":
+                        body = {
+                            "transaction": encode_payload(payload),
+                            "sender_id": self.node_id,
+                            "relay": True,
+                        }
+                        resp = requests.post(full_url, json=body, timeout=5)
+                    else:
+                        block_body = payload if isinstance(payload, dict) else block_to_dict(payload)
+                        body = {"payload": block_body, "sender_id": self.node_id}
+                        resp = requests.post(full_url, json=body, timeout=5)
+                    resp.raise_for_status()
+                except Exception as e:
+                    print(f"[WARN] HTTP broadcast to {full_url} failed: {e}")
+        else:
+            print(f"[{self.node_id}] ブロードキャスト送信: {msg_type}")
+            for peer in self.peers:
+                peer.receive_message(msg_type, payload, self.node_id)
+
 
     # ------------------------------------------
     # PBFT メッセージ受信ハンドラ

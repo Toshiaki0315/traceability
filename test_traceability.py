@@ -814,5 +814,76 @@ class TestNodeWebAPI(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertTrue(res.json()["integrity"])
 
+class TestBulkTransactionProcessing(unittest.TestCase):
+    """ステップ11: トランザクションのバルク処理（バッチ処理）のテスト"""
+
+    def setUp(self):
+        from traceability import Node
+        self.leader = Node("LeaderNode", "Leader")
+        self.replica = Node("ReplicaNode", "Replica")
+        
+        self.leader.add_peer(self.replica)
+        self.replica.add_peer(self.leader)
+        
+        from traceability import generate_keypair
+        self.pub, self.priv = generate_keypair()
+
+    def test_bulk_max_count_trigger(self):
+        """BULK_MAX_COUNTに達したときに一括してブロック提案されること"""
+        from traceability import sign_data
+        self.leader.bulk_max_count = 3
+        self.leader.bulk_max_wait = 100
+
+        for i in range(2):
+            tx_data = {"item": f"item_{i}", "weight_kg": 150}
+            payload = {"data": tx_data, "signature": sign_data(tx_data, self.priv), "public_key": self.pub}
+            self.leader.receive_message("NEW_TRANSACTION", payload, "Sender")
+            self.replica.receive_message("NEW_TRANSACTION", payload, "Sender")
+
+        self.assertEqual(len(self.leader.chain.chain), 1)
+        self.assertEqual(len(self.leader.pending_transactions), 2)
+
+        tx_data = {"item": "item_2", "weight_kg": 150}
+        payload = {"data": tx_data, "signature": sign_data(tx_data, self.priv), "public_key": self.pub}
+        
+        self.leader.receive_message("NEW_TRANSACTION", payload, "Sender")
+        self.replica.receive_message("NEW_TRANSACTION", payload, "Sender")
+        
+        self.assertEqual(len(self.leader.pending_transactions), 3)
+        
+        self.leader.maybe_create_bulk_block()
+        
+        self.assertEqual(len(self.leader.chain.chain), 2)
+        latest_block = self.leader.chain.get_latest_block()
+        self.assertEqual(len(latest_block.data), 3)
+        self.assertEqual(len(self.leader.pending_transactions), 0)
+
+    def test_bulk_max_wait_trigger(self):
+        """時間経過(BULK_MAX_WAIT_SECONDS)によって自動的にブロック提案されること"""
+        import time
+        from traceability import sign_data
+        
+        self.leader.bulk_max_count = 10
+        self.leader.bulk_max_wait = 1
+        self.leader.last_bulk_time = time.time()
+
+        tx_data = {"item": "time_item", "weight_kg": 150}
+        payload = {"data": tx_data, "signature": sign_data(tx_data, self.priv), "public_key": self.pub}
+        self.leader.receive_message("NEW_TRANSACTION", payload, "Sender")
+        self.replica.receive_message("NEW_TRANSACTION", payload, "Sender")
+
+        self.assertEqual(len(self.leader.chain.chain), 1)
+        self.assertEqual(len(self.leader.pending_transactions), 1)
+
+        for _ in range(30):
+            if len(self.leader.chain.chain) == 2:
+                break
+            time.sleep(0.1)
+
+        self.assertEqual(len(self.leader.chain.chain), 2)
+        latest_block = self.leader.chain.get_latest_block()
+        self.assertEqual(len(latest_block.data), 1)
+        self.assertEqual(len(self.leader.pending_transactions), 0)
+
 if __name__ == '__main__':
     unittest.main()

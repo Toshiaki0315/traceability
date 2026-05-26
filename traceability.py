@@ -4,6 +4,7 @@ import json
 import os
 import time
 import rsa
+import threading
 import duckdb
 
 # HTTPブロードキャスト用のエンドポイントマッピング（ステップ10）
@@ -330,6 +331,12 @@ class Node:
         self.prepares = {}  # {block_hash: set(node_ids)}
         self.commits = {}   # {block_hash: set(node_ids)}
         self.business_rules = []
+        self.bulk_max_count = int(os.getenv('BULK_MAX_COUNT', 10))
+        self.bulk_max_wait = int(os.getenv('BULK_MAX_WAIT_SECONDS', 5))
+        self.last_bulk_time = time.time()
+        self._pending_lock = threading.Lock()
+        if self.role == "Leader":
+            threading.Thread(target=self._batch_watcher, daemon=True).start()
 
     def set_peer_urls(self, urls: list[str]):
         """ノード起動時にピアURLリストを設定する（ステップ10）"""
@@ -481,7 +488,11 @@ class Node:
                 print(f"     [{self.node_id}] 【警告】ビジネスルール検証中にエラーが発生したためトランザクションを破棄しました: {e}")
                 return
 
-        self.pending_transactions.append(payload)
+        # Thread-safe addition to pending transactions
+        with self._pending_lock:
+            self.pending_transactions.append(payload)
+            if len(self.pending_transactions) == 1:
+                self.last_bulk_time = time.time()
         print(f"     [{self.node_id}] トランザクションを未承認リストに追加しました。")
 
     def _handle_pre_prepare(self, block):
@@ -570,13 +581,13 @@ class Node:
         if self.role != "Leader":
             raise PermissionError("ブロックを提案できるのはLeaderノードのみです。")
 
-        if not self.pending_transactions:
-            print(f"[{self.node_id}] 提案するトランザクションがありません。")
-            return None
-
-        # 溜まっているトランザクションを取得（今回は全て）
-        transactions_to_block = self.pending_transactions.copy()
-        self.pending_transactions.clear()
+        # Thread-safe check and extraction of pending transactions
+        with self._pending_lock:
+            if not self.pending_transactions:
+                print(f"[{self.node_id}] 提案するトランザクションがありません。")
+                return None
+            transactions_to_block = self.pending_transactions.copy()
+            self.pending_transactions.clear()
 
         # 新しいブロック候補を作成（まだ自身のチェーンには追加しない）
         latest_block = self.chain.get_latest_block()
@@ -600,6 +611,22 @@ class Node:
 
         return proposed_block
 
+    def _batch_watcher(self):
+        """Background thread that monitors pending transactions and creates bulk blocks."""
+        while True:
+            time.sleep(1)
+            trigger_bulk = False
+            with self._pending_lock:
+                if self.pending_transactions:
+                    elapsed = time.time() - self.last_bulk_time
+                    if len(self.pending_transactions) >= self.bulk_max_count or elapsed >= self.bulk_max_wait:
+                        trigger_bulk = True
+            if trigger_bulk:
+                self.maybe_create_bulk_block()
+
+    def maybe_create_bulk_block(self):
+        """Create a block from pending transactions if any."""
+        self.propose_block()
 
 # ==========================================
 # 実行サンプル: PBFTコンセンサスのシミュレーション

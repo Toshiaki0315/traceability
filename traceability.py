@@ -33,6 +33,7 @@ class OffChainStore:
         self._create_table()
 
     def _create_table(self):
+        # レガシーデータのテーブル構造はそのまま維持
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS manufacturing_details (
                 record_id VARCHAR PRIMARY KEY,
@@ -42,9 +43,79 @@ class OffChainStore:
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # 新仕様のテーブル
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS product_traceability (
+                id VARCHAR PRIMARY KEY,
+                trace_id VARCHAR NOT NULL,
+                version INTEGER NOT NULL,
+                payload JSON NOT NULL,
+                salt VARCHAR(64) NOT NULL,
+                is_deleted BOOLEAN DEFAULT FALSE,
+                tx_status VARCHAR DEFAULT 'PENDING',
+                created_by VARCHAR,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(trace_id, version)
+            )
+        """)
+        # インデックス定義
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trace_version ON product_traceability(trace_id, version DESC)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tx_status ON product_traceability(tx_status)
+        """)
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trace_deleted ON product_traceability(trace_id, is_deleted)
+        """)
 
-    def save_record(self, record_id, lot_number, process_name, details):
-        """詳細データをオフチェーンDBに保存し、SHA-256ハッシュ値を算出する"""
+    def calculate_hash(self, payload: dict, salt: str) -> str:
+        """詳細データ(payload)とsaltから、JSON正規化ルールを適用してSHA-256ハッシュ値を算出する"""
+        normalized_payload = json.dumps(
+            payload,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":")
+        )
+        hash_input = json.dumps(
+            {
+                "payload": normalized_payload,
+                "salt": salt
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(hash_input).hexdigest()
+
+    def save_record(self, trace_id, payload, created_by=None):
+        """新規トレーサビリティデータを登録する (CREATE)。tx_status='PENDING' で保存し、ハッシュとSaltを返す。"""
+        import secrets
+        import uuid
+        salt = secrets.token_hex(32)
+        version = 1
+        record_id = str(uuid.uuid4())
+        
+        # payload は dict または JSON 文字列
+        if isinstance(payload, str):
+            payload_dict = json.loads(payload)
+            payload_json = payload
+        else:
+            payload_dict = payload
+            payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+            
+        self.conn.execute("""
+            INSERT INTO product_traceability (id, trace_id, version, payload, salt, tx_status, created_by)
+            VALUES (?, ?, ?, ?, ?, 'PENDING', ?)
+        """, (record_id, trace_id, version, payload_json, salt, created_by))
+        
+        h = self.calculate_hash(payload_dict, salt)
+        print(f"[INFO] Off-chain record saved: trace_id={trace_id} version={version} status=PENDING")
+        return h, salt
+
+    def save_legacy_record(self, record_id, lot_number, process_name, details):
+        """レガシーテーブル(manufacturing_details)へ詳細データを保存しSHA-256ハッシュを返す"""
         details_str = json.dumps(details, sort_keys=True) if isinstance(details, dict) else str(details)
         self.conn.execute("""
             INSERT OR REPLACE INTO manufacturing_details (record_id, lot_number, process_name, details)
@@ -52,20 +123,182 @@ class OffChainStore:
         """, (record_id, lot_number, process_name, details_str))
         return self.calculate_record_hash(record_id, lot_number, process_name, details_str)
 
-    def calculate_record_hash(self, record_id, lot_number, process_name, details):
-        """オフチェーンデータレコードに対するSHA-256ハッシュを一貫した方法で計算する"""
-        details_str = json.dumps(details, sort_keys=True) if isinstance(details, dict) else str(details)
-        content = {
-            "record_id": record_id,
-            "lot_number": lot_number,
-            "process_name": process_name,
-            "details": details_str
+    def update_record(self, trace_id, payload, updated_by=None, reason=None):
+        """既存データを修正する (UPDATE)。新しい version を PENDING で INSERT する。"""
+        import secrets
+        import uuid
+
+        # Soft Delete 済みチェック（get_latest_record が None を返す前に判定）
+        is_deleted_check = self.conn.execute("""
+            SELECT COUNT(*) FROM product_traceability
+            WHERE trace_id = ? AND tx_status = 'COMMITTED' AND is_deleted = TRUE
+        """, (trace_id,)).fetchone()[0]
+        if is_deleted_check > 0:
+            raise ValueError("already_deleted")
+
+        # 最新の COMMITTED レコードを取得
+        latest = self.get_latest_record(trace_id)
+        if not latest:
+            exists = self.conn.execute(
+                "SELECT COUNT(*) FROM product_traceability WHERE trace_id = ?",
+                (trace_id,),
+            ).fetchone()[0]
+            if exists == 0:
+                raise ValueError("trace_not_found")
+            raise ValueError("pending_transaction_exists")
+
+        # PENDING レコード存在チェック
+        pending_check = self.conn.execute("""
+            SELECT COUNT(*) FROM product_traceability
+            WHERE trace_id = ? AND tx_status = 'PENDING'
+        """, (trace_id,)).fetchone()[0]
+        if pending_check > 0:
+            raise ValueError("pending_transaction_exists")
+            
+        latest_version = latest["version"]
+        version = latest_version + 1
+        salt = secrets.token_hex(32)
+        record_id = str(uuid.uuid4())
+        
+        if isinstance(payload, str):
+            payload_dict = json.loads(payload)
+            payload_json = payload
+        else:
+            payload_dict = payload
+            payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+            
+        self.conn.execute("""
+            INSERT INTO product_traceability (id, trace_id, version, payload, salt, tx_status, created_by)
+            VALUES (?, ?, ?, ?, ?, 'PENDING', ?)
+        """, (record_id, trace_id, version, payload_json, salt, updated_by))
+        
+        h = self.calculate_hash(payload_dict, salt)
+        print(f"[INFO] Off-chain record updated: trace_id={trace_id} version={version} status=PENDING")
+        return h, salt
+
+    def validate_soft_delete(self, trace_id):
+        """Soft Delete 前バリデーションを行い、対象の最新 version を返す。"""
+        # 1. 存在確認（COMMITTED レコードがあるか）
+        committed_count = self.conn.execute("""
+            SELECT COUNT(*) FROM product_traceability
+            WHERE trace_id = ? AND tx_status = 'COMMITTED'
+        """, (trace_id,)).fetchone()[0]
+        if committed_count == 0:
+            raise ValueError("trace_not_found")
+            
+        # 4. すでに Soft Delete 済みでないこと
+        deleted_count = self.conn.execute("""
+            SELECT COUNT(*) FROM product_traceability
+            WHERE trace_id = ? AND tx_status = 'COMMITTED' AND is_deleted = TRUE
+        """, (trace_id,)).fetchone()[0]
+        if deleted_count > 0:
+            raise ValueError("already_deleted")
+            
+        # 5. PENDING レコードが存在しないこと
+        pending_count = self.conn.execute("""
+            SELECT COUNT(*) FROM product_traceability
+            WHERE trace_id = ? AND tx_status = 'PENDING'
+        """, (trace_id,)).fetchone()[0]
+        if pending_count > 0:
+            raise ValueError("pending_transaction_exists")
+            
+        # 最新の version を取得
+        latest_version = self.conn.execute("""
+            SELECT MAX(version) FROM product_traceability
+            WHERE trace_id = ? AND tx_status = 'COMMITTED'
+        """, (trace_id,)).fetchone()[0]
+        return latest_version
+
+    def hard_delete(self, trace_id, executed_by=None, reason=None, anchored_hashes=None, log_path="data/hard_delete.log"):
+        """指定された trace_id に紐づく全 version のオフチェーンデータを物理削除し、ログに記録する (Hard Delete)。"""
+        # 1. 存在確認
+        exists = self.conn.execute("""
+            SELECT COUNT(*) FROM product_traceability WHERE trace_id = ?
+        """, (trace_id,)).fetchone()[0]
+        if exists == 0:
+            raise ValueError("trace_not_found")
+            
+        # 3. 削除対象 version 数
+        deleted_versions = self.conn.execute("""
+            SELECT COUNT(*) FROM product_traceability WHERE trace_id = ?
+        """, (trace_id,)).fetchone()[0]
+        
+        # 5. audit_log_id を生成
+        import uuid
+        audit_log_id = f"hd-{uuid.uuid4()}"
+        
+        # 6. Hard Delete ログの記録
+        from datetime import datetime, timezone
+        os.makedirs(os.path.dirname(log_path) if os.path.dirname(log_path) else ".", exist_ok=True)
+
+        log_entry = {
+            "audit_log_id": audit_log_id,
+            "executed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "executed_by": executed_by,
+            "trace_id": trace_id,
+            "deleted_versions": deleted_versions,
+            "anchored_hashes": anchored_hashes or [],
+            "reason": reason
         }
-        content_bytes = json.dumps(content, sort_keys=True).encode()
-        return hashlib.sha256(content_bytes).hexdigest()
+        
+        with open(log_path, "a", encoding="utf-8") as lf:
+            lf.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+            
+        # 7. トランザクション内で削除
+        self.conn.execute("BEGIN TRANSACTION")
+        try:
+            self.conn.execute("""
+                DELETE FROM product_traceability
+                WHERE trace_id = ?
+            """, (trace_id,))
+            self.conn.execute("COMMIT")
+        except Exception as e:
+            self.conn.execute("ROLLBACK")
+            raise e
+            
+        return audit_log_id, deleted_versions
+
+    def get_latest_record(self, trace_id):
+        """最新の COMMITTED でかつ削除されていないレコードを取得する"""
+        res = self.conn.execute("""
+            SELECT id, trace_id, version, payload, salt, is_deleted, tx_status, created_by, created_at, updated_at
+            FROM product_traceability p
+            WHERE p.trace_id = ?
+              AND p.tx_status = 'COMMITTED'
+              AND p.is_deleted = FALSE
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM product_traceability d
+                  WHERE d.trace_id = p.trace_id
+                    AND d.tx_status = 'COMMITTED'
+                    AND d.is_deleted = TRUE
+              )
+            ORDER BY p.version DESC
+            LIMIT 1
+        """, (trace_id,)).fetchone()
+        if not res:
+            return None
+        
+        try:
+            payload_data = json.loads(res[3])
+        except Exception:
+            payload_data = res[3]
+            
+        return {
+            "id": res[0],
+            "trace_id": res[1],
+            "version": res[2],
+            "payload": payload_data,
+            "salt": res[4],
+            "is_deleted": res[5],
+            "tx_status": res[6],
+            "created_by": res[7],
+            "created_at": res[8],
+            "updated_at": res[9]
+        }
 
     def get_record(self, record_id):
-        """指定されたrecord_idのオフチェーンデータを取得する"""
+        """指定されたrecord_idのレガシーオフチェーンデータを取得する"""
         res = self.conn.execute("""
             SELECT record_id, lot_number, process_name, details FROM manufacturing_details
             WHERE record_id = ?
@@ -78,6 +311,18 @@ class OffChainStore:
             "process_name": res[2],
             "details": res[3]
         }
+
+    def calculate_record_hash(self, record_id, lot_number, process_name, details):
+        """レガシーデータレコードに対するSHA-256ハッシュを一貫した方法で計算する"""
+        details_str = json.dumps(details, sort_keys=True) if isinstance(details, dict) else str(details)
+        content = {
+            "record_id": record_id,
+            "lot_number": lot_number,
+            "process_name": process_name,
+            "details": details_str
+        }
+        content_bytes = json.dumps(content, sort_keys=True).encode()
+        return hashlib.sha256(content_bytes).hexdigest()
 
     def close(self):
         self.conn.close()
@@ -169,7 +414,7 @@ def dict_to_block(block_dict: dict) -> "Block":
 
 def default_weight_check_rule(payload):
     """原料重量が100kg以上であることを検証するデフォルトビジネスルール"""
-    if payload.get("type") == "OFFCHAIN_ANCHOR":
+    if payload.get("type") in ("OFFCHAIN_ANCHOR", "OFFCHAIN_UPDATE", "OFFCHAIN_SOFT_DELETE"):
         return True
     data = payload.get("data", {})
     weight = data.get("weight_kg", 0)
@@ -335,8 +580,49 @@ class Node:
         self.bulk_max_wait = int(os.getenv('BULK_MAX_WAIT_SECONDS', 5))
         self.last_bulk_time = time.time()
         self._pending_lock = threading.Lock()
+        self.offchain_store = None
         if self.role == "Leader":
             threading.Thread(target=self._batch_watcher, daemon=True).start()
+        # TTL監視スレッドの開始
+        threading.Thread(target=self._pending_ttl_watcher, daemon=True).start()
+
+    def set_offchain_store(self, store):
+        """オフチェーンストアをノードに関連付ける"""
+        self.offchain_store = store
+
+    def _pending_ttl_watcher(self):
+        """PENDINGレコードのTTL超過を監視するスレッド"""
+        while True:
+            time.sleep(10)
+            if not self.offchain_store:
+                continue
+                
+            try:
+                ttl_seconds = int(os.getenv("PBFT_PENDING_TTL_SECONDS", "30"))
+                from datetime import datetime, timedelta, timezone
+                cutoff = datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)
+                
+                # タイムアウトしたレコードを特定して警告ログを出力
+                timeouts = self.offchain_store.conn.execute("""
+                    SELECT trace_id, version FROM product_traceability
+                    WHERE tx_status = 'PENDING'
+                      AND created_at < ?
+                """, (cutoff,)).fetchall()
+                
+                for trace_id, version in timeouts:
+                    print(f"[WARN] PBFT consensus timeout: trace_id={trace_id}, version={version}")
+                    
+                # 状態を FAILED に更新
+                self.offchain_store.conn.execute("""
+                    UPDATE product_traceability
+                    SET tx_status = 'FAILED',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE tx_status = 'PENDING'
+                      AND created_at < ?
+                """, (cutoff,))
+                
+            except Exception as e:
+                print(f"[ERROR] Error in PENDING TTL watcher: {e}")
 
     def set_peer_urls(self, urls: list[str]):
         """ノード起動時にピアURLリストを設定する（ステップ10）"""
@@ -572,6 +858,199 @@ class Node:
             if self.chain.get_latest_block().hash != block.hash:
                 self.chain.chain.append(block)
                 print(f"[{self.node_id}] ★ブロック確定！ (Hash: {block.hash[:8]}...)")
+                
+                # オフチェーンデータのステータス更新 (フック)
+                if hasattr(self, "offchain_store") and self.offchain_store:
+                    self._finalize_offchain_status(block)
+
+    def _finalize_offchain_status(self, block):
+        """確定したブロック内のトランザクションに基づいてオフチェーンデータを COMMITTED または論理削除に更新する"""
+        txs = block.data
+        if not isinstance(txs, list):
+            txs = [txs]
+            
+        for tx in txs:
+            if not isinstance(tx, dict):
+                continue
+            tx_type = tx.get("type")
+            tx_data = tx.get("data", {})
+            
+            if tx_type in ("OFFCHAIN_ANCHOR", "OFFCHAIN_UPDATE"):
+                trace_id = tx_data.get("trace_id")
+                version = tx_data.get("version")
+                if trace_id and version:
+                    # 冪等な更新 (tx_status = 'PENDING' のみ対象)
+                    res = self.offchain_store.conn.execute("""
+                        UPDATE product_traceability
+                        SET tx_status = 'COMMITTED',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE trace_id = ?
+                          AND version = ?
+                          AND tx_status = 'PENDING'
+                    """, (trace_id, version))
+                    
+                    if res.rowcount == 0:
+                        # 冪等性の検証、存在確認
+                        check = self.offchain_store.conn.execute("""
+                            SELECT tx_status FROM product_traceability
+                            WHERE trace_id = ? AND version = ?
+                        """, (trace_id, version)).fetchone()
+                        if check:
+                            status = check[0]
+                            if status == "COMMITTED":
+                                print(f"[WARN] COMMITTED update skipped: already committed or missing trace_id={trace_id} version={version}")
+                            else:
+                                print(f"[ERROR] COMMITTED update failed: off-chain record in status {status} trace_id={trace_id} version={version}")
+                        else:
+                            print(f"[ERROR] COMMITTED update failed: off-chain record missing trace_id={trace_id} version={version}")
+                    else:
+                        print(f"[INFO] PBFT committed: trace_id={trace_id} version={version}")
+                        
+            elif tx_type == "OFFCHAIN_SOFT_DELETE":
+                trace_id = tx_data.get("trace_id")
+                if trace_id:
+                    res = self.offchain_store.conn.execute("""
+                        UPDATE product_traceability
+                        SET is_deleted = TRUE,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE trace_id = ?
+                          AND tx_status = 'COMMITTED'
+                          AND is_deleted = FALSE
+                    """, (trace_id,))
+                    print(f"[INFO] PBFT soft deleted: trace_id={trace_id}, rowcount={res.rowcount}")
+
+    def _iter_onchain_transactions(self):
+        """チェーン内の全トランザクションを (tx_type, tx_data) で yield する"""
+        for block in self.chain.chain[1:]:
+            if isinstance(block.data, list):
+                for tx in block.data:
+                    if isinstance(tx, dict):
+                        yield tx.get("type"), tx.get("data", {})
+            elif isinstance(block.data, dict):
+                tx_data = block.data
+                tx_type = block.process_name if block.process_name in (
+                    "OFFCHAIN_ANCHOR", "OFFCHAIN_UPDATE", "OFFCHAIN_SOFT_DELETE"
+                ) else tx_data.get("type")
+                yield tx_type, tx_data
+
+    def audit_trace_data(self, trace_id, offchain_store):
+        """新仕様データ(product_traceability)に対する監査を実行する。"""
+        onchain_anchors = {}
+        onchain_soft_deletes = []
+
+        for tx_type, tx_data in self._iter_onchain_transactions():
+            if not isinstance(tx_data, dict) or tx_data.get("trace_id") != trace_id:
+                continue
+            if tx_type in ("OFFCHAIN_ANCHOR", "OFFCHAIN_UPDATE"):
+                v = tx_data.get("version")
+                h = tx_data.get("hash")
+                if v is not None:
+                    onchain_anchors[v] = h
+            elif tx_type == "OFFCHAIN_SOFT_DELETE":
+                onchain_soft_deletes.append(tx_data)
+
+        # オフチェーン DB のデータを取得
+        offchain_records = offchain_store.conn.execute("""
+            SELECT version, payload, salt, is_deleted, tx_status FROM product_traceability
+            WHERE trace_id = ?
+        """, (trace_id,)).fetchall()
+
+        # 1. Hard Delete 監査の判定
+        if len(offchain_records) == 0:
+            if len(onchain_anchors) > 0:
+                print(f"     [{self.node_id}] 【監査成功】レコード {trace_id} は物理削除(Hard Deleted)されています。")
+                return {
+                    "valid": True,
+                    "status": "hard_deleted",
+                    "trace_id": trace_id,
+                    "note": "Off-chain data has been permanently erased."
+                }
+            else:
+                print(f"     [{self.node_id}] 【監査エラー】レコード {trace_id} が見つかりません。")
+                return {
+                    "valid": False,
+                    "status": "not_found",
+                    "reason": "trace_not_found"
+                }
+
+        # 2. Soft Delete 監査の判定
+        committed_offchain = [r for r in offchain_records if r[4] == "COMMITTED"]
+        has_soft_delete_tx = len(onchain_soft_deletes) > 0
+        all_deleted_offchain = len(committed_offchain) > 0 and all(r[3] is True for r in committed_offchain)
+        any_deleted_offchain = any(r[3] is True for r in committed_offchain)
+
+        # 不整合の検証
+        is_mismatch = False
+        if has_soft_delete_tx != all_deleted_offchain:
+            is_mismatch = True
+        elif any_deleted_offchain != all_deleted_offchain:
+            is_mismatch = True # 同一 trace_id 内で is_deleted が揃っていない
+            
+        if is_mismatch:
+            print(f"     [{self.node_id}] 【監査エラー】レコード {trace_id} の論理削除(Soft Delete)状態に不整合が検出されました。")
+            return {
+                "valid": False,
+                "status": "soft_delete_mismatch",
+                "reason": "soft_delete_mismatch"
+            }
+
+        if has_soft_delete_tx:
+            latest_delete = onchain_soft_deletes[-1]
+            print(f"     [{self.node_id}] 【監査成功】レコード {trace_id} は論理削除(Soft Deleted)されています。")
+            return {
+                "valid": True,
+                "status": "soft_deleted",
+                "trace_id": trace_id,
+                "target_version": latest_delete.get("target_version"),
+                "deleted_by": latest_delete.get("deleted_by"),
+                "reason": latest_delete.get("reason")
+            }
+
+        # 3. 通常レコード(active)のハッシュ検証
+        for r_version, r_payload, r_salt, r_is_deleted, r_tx_status in committed_offchain:
+            if r_version not in onchain_anchors:
+                # オフチェーンにのみ存在する
+                print(f"     [{self.node_id}] 【監査エラー】レコード {trace_id} (version {r_version}) がオンチェーンに見つかりません。")
+                return {
+                    "valid": False,
+                    "status": "tampered",
+                    "reason": "hash_mismatch"
+                }
+            
+            try:
+                payload_dict = json.loads(r_payload) if isinstance(r_payload, str) else r_payload
+            except Exception:
+                payload_dict = r_payload
+
+            recalculated = offchain_store.calculate_hash(payload_dict, r_salt)
+            anchored = onchain_anchors[r_version]
+
+            if recalculated != anchored:
+                print(f"     [{self.node_id}] 【監査警告】レコード {trace_id} (version {r_version}) のハッシュ不一致を検出しました！")
+                return {
+                    "valid": False,
+                    "status": "tampered",
+                    "reason": "hash_mismatch"
+                }
+
+        # 逆方向 (オンチェーンにある version がオフチェーンにあるか)
+        for v in onchain_anchors:
+            if not any(r[0] == v for r in committed_offchain):
+                print(f"     [{self.node_id}] 【監査エラー】オンチェーンレコード {trace_id} (version {v}) がオフチェーンに見つかりません。")
+                return {
+                    "valid": False,
+                    "status": "tampered",
+                    "reason": "hash_mismatch"
+                }
+
+        latest_version = max([r[0] for r in committed_offchain]) if len(committed_offchain) > 0 else 1
+        print(f"     [{self.node_id}] 【監査成功】レコード {trace_id} の整合性を確認しました。")
+        return {
+            "valid": True,
+            "status": "active",
+            "trace_id": trace_id,
+            "version": latest_version
+        }
 
     # ------------------------------------------
     # リーダー専用: ブロック提案
@@ -656,7 +1135,7 @@ if __name__ == "__main__":
     # ビジネスルールの定義と登録
     def weight_check_rule(payload):
         # アンカーデータなど特殊トランザクションは重量チェックをスキップ
-        if payload.get("type") == "OFFCHAIN_ANCHOR":
+        if payload.get("type") in ("OFFCHAIN_ANCHOR", "OFFCHAIN_UPDATE", "OFFCHAIN_SOFT_DELETE"):
             return True
         data = payload.get("data", {})
         weight = data.get("weight_kg", 0)
@@ -764,7 +1243,7 @@ if __name__ == "__main__":
     
     print("[Off-chain] 詳細な加工ログデータをDuckDB（オフチェーン）に保存します...")
     # 保存してハッシュを計算
-    offchain_hash = offchain_store.save_record(
+    offchain_hash = offchain_store.save_legacy_record(
         record_id=record_id,
         lot_number="RAW-A001",
         process_name="詳細加熱加工ログ",

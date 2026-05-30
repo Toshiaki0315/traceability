@@ -711,6 +711,29 @@
                         </table>
                     </div>
                 </div>
+
+                <!-- New Spec product_traceability Explorer -->
+                <div class="panel">
+                    <div class="panel-title">新仕様プロダクト・トレーサビリティ (DuckDB - product_traceability)</div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>trace_id</th>
+                                    <th style="text-align: center;">version</th>
+                                    <th>合意状態 (tx_status)</th>
+                                    <th>論理削除状態</th>
+                                    <th>詳細データ (payload)</th>
+                                    <th>整合性監査 (Audit)</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="new-offchain-table-body">
+                                <tr><td colspan="7" style="text-align: center; color: var(--text-muted);">新仕様(product_traceability)時系列詳細データはまだ登録されていません。</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
 
             <!-- Right Column: Live Terminal Output -->
@@ -785,6 +808,7 @@
                 renderNodes(data.nodes);
                 renderBlockchain(data.blockchain);
                 renderOffchain(data.offchain);
+                renderOffchainNew(data.offchain_new || []);
                 renderLogs(data.logs);
             } catch (err) {
                 console.error("Error fetching states:", err);
@@ -874,7 +898,6 @@
                     `;
                 }
 
-                // Make details readable
                 const detailsStr = typeof rec.details === 'object' ? JSON.stringify(rec.details) : rec.details;
 
                 return `
@@ -902,7 +925,84 @@
             }).join('');
         }
 
-        // Cache last logs size to prevent excessive DOM updates
+        function renderOffchainNew(records) {
+            const tbody = document.getElementById('new-offchain-table-body');
+            if (records.length === 0) {
+                tbody.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted);">新仕様(product_traceability)時系列詳細データはまだ登録されていません。</td></tr>`;
+                return;
+            }
+
+            tbody.innerHTML = records.map(rec => {
+                const auditState = auditStatuses[rec.trace_id] || { status: 'unchecked', onchain_hash: '', offchain_hash: '' };
+                
+                let badgeHtml = '';
+                if (auditState.status === 'unchecked') {
+                    badgeHtml = `<span class="audit-badge unchecked">❔ 未監査</span>`;
+                } else if (auditState.status === 'success') {
+                    if (auditState.details && auditState.details.status === 'soft_deleted') {
+                        badgeHtml = `<span class="audit-badge success" style="background:rgba(245,158,11,0.15); color:#f59e0b; border:1px solid rgba(245,158,11,0.3)">🟠 論理削除(整合)</span>`;
+                    } else if (auditState.details && auditState.details.status === 'hard_deleted') {
+                        badgeHtml = `<span class="audit-badge success" style="background:rgba(239,68,68,0.15); color:#f87171; border:1px solid rgba(239,68,68,0.3)">🔴 物理削除(整合)</span>`;
+                    } else {
+                        badgeHtml = `<span class="audit-badge success">✅ 監査成功</span>`;
+                    }
+                } else {
+                    if (auditState.details && auditState.details.status === 'soft_delete_mismatch') {
+                        badgeHtml = `<span class="audit-badge failed">❌ 論理削除不整合</span>`;
+                    } else {
+                        badgeHtml = `<span class="audit-badge failed">❌ 改ざん検知！</span>`;
+                    }
+                }
+
+                const detailsStr = typeof rec.payload === 'object' ? JSON.stringify(rec.payload) : rec.payload;
+                
+                let statusBadge = `<span style="font-size:11px; padding:2px 6px; border-radius:4px; font-weight:600; font-family:var(--font-mono); `;
+                if (rec.tx_status === 'PENDING') {
+                    statusBadge += `background:rgba(245,158,11,0.15); color:#f59e0b;">PENDING</span>`;
+                } else if (rec.tx_status === 'COMMITTED') {
+                    statusBadge += `background:rgba(16,185,129,0.15); color:#34d399;">COMMITTED</span>`;
+                } else {
+                    statusBadge += `background:rgba(239,68,68,0.15); color:#f87171;">FAILED</span>`;
+                }
+
+                const deletedLabel = rec.is_deleted ? `<span style="color:#ef4444; font-weight:600;">論理削除済み</span>` : `アクティブ`;
+                const isActionable = rec.tx_status === 'COMMITTED' && !rec.is_deleted;
+
+                return `
+                    <tr>
+                        <td style="font-family: var(--font-mono); font-weight: 600;">${rec.trace_id}</td>
+                        <td style="font-family: var(--font-mono); text-align: center;">${rec.version}</td>
+                        <td>${statusBadge}</td>
+                        <td>${deletedLabel}</td>
+                        <td>
+                            <div style="font-size: 12px; color: var(--text-muted); max-width: 250px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title='${detailsStr}'>
+                                ${detailsStr}
+                            </div>
+                            <div style="font-size: 10px; color: rgba(255,255,255,0.3); margin-top: 2px;">Salt: ${rec.salt.substring(0,8)}...</div>
+                        </td>
+                        <td>${badgeHtml}</td>
+                        <td class="action-cell">
+                            <button class="btn btn-secondary btn-sm" onclick="auditRecord('${rec.trace_id}')">
+                                監査
+                            </button>
+                            <button class="btn btn-secondary btn-sm" onclick="openUpdateModal('${rec.trace_id}')" ${isActionable ? '' : 'disabled'}>
+                                修正
+                            </button>
+                            <button class="btn btn-secondary btn-danger btn-sm" onclick="softDeleteRecord('${rec.trace_id}')" ${isActionable ? '' : 'disabled'}>
+                                論理削除
+                            </button>
+                            <button class="btn btn-secondary btn-danger btn-sm" onclick="openHardDeleteModal('${rec.trace_id}')">
+                                物理削除
+                            </button>
+                            <button class="btn btn-secondary btn-sm" style="background:rgba(255,255,255,0.05); color:#aaa;" onclick="tamperRecord('${rec.trace_id}')" ${rec.is_deleted ? 'disabled' : ''}>
+                                改ざん
+                            </button>
+                        </td>
+                    </tr>
+                `;
+            }).join('');
+        }
+
         let lastLogsCount = 0;
 
         function renderLogs(logs) {
@@ -913,7 +1013,7 @@
                 let cssClass = 'info';
                 if (line.includes('★ブロック確定')) cssClass = 'success';
                 else if (line.includes('【監査成功】')) cssClass = 'success';
-                else if (line.includes('【警告】') || line.includes('【監査警告】')) cssClass = 'danger';
+                else if (line.includes('【警告】') || line.includes('【監査警告】') || line.includes('timeout')) cssClass = 'danger';
                 else if (line.includes('改ざん')) cssClass = 'danger';
                 else if (line.includes('ブロードキャスト送信')) cssClass = 'warn';
                 else if (line.includes('[API]')) cssClass = 'system';
@@ -922,7 +1022,6 @@
             }).join('');
             
             lastLogsCount = logs.length;
-            // Scroll to bottom
             terminal.scrollTop = terminal.scrollHeight;
         }
 
@@ -997,7 +1096,6 @@
 
                 if (response.ok) {
                     showNotification('オフチェーン詳細データを保存し、オンチェーンハッシュを送信しました。合意形成を実行してください。', 'success');
-                    // Reset inputs
                     document.getElementById('off-record-id').value = '';
                     document.getElementById('off-lot-number').value = '';
                     fetchState();
@@ -1022,21 +1120,33 @@
                 if (data.valid) {
                     auditStatuses[record_id] = {
                         status: 'success',
-                        onchain_hash: data.onchain_hash,
-                        offchain_hash: data.offchain_hash
+                        onchain_hash: data.onchain_hash || '',
+                        offchain_hash: data.offchain_hash || '',
+                        details: data
                     };
-                    showNotification(`監査成功: レコード ${record_id} の整合性がオンチェーンハッシュと一致しました！`, 'success');
+                    let statusMsg = "";
+                    if (data.status === 'soft_deleted') {
+                        statusMsg = ` (論理削除が整合しています。理由: ${data.details.reason || 'なし'})`;
+                    } else if (data.status === 'hard_deleted') {
+                        statusMsg = ` (物理削除が整合しています。実データ消去済み)`;
+                    }
+                    showNotification(`整合性監査成功: レコード ${record_id} の整合性をオンチェーンと照合しました！${statusMsg}`, 'success');
                 } else {
                     auditStatuses[record_id] = {
                         status: 'failed',
-                        onchain_hash: data.onchain_hash,
-                        offchain_hash: data.offchain_hash
+                        onchain_hash: data.onchain_hash || '',
+                        offchain_hash: data.offchain_hash || '',
+                        details: data
                     };
-                    showNotification(`警告！ レコード ${record_id} の改ざんが検知されました！`, 'error');
+                    let warnMsg = "ハッシュ不一致を検出しました！";
+                    if (data.status === 'soft_delete_mismatch') {
+                        warnMsg = "論理削除状態の不整合を検出しました！";
+                    }
+                    showNotification(`警告！ レコード ${record_id} の${warnMsg}`, 'error');
                 }
                 fetchState();
             } catch (err) {
-                showNotification('監査クエリの送信に失敗しました。', 'error');
+                showNotification('監査クエアの送信に失敗しました。', 'error');
             }
         }
 
@@ -1059,13 +1169,123 @@
             }
         }
 
+        function openUpdateModal(trace_id) {
+            document.getElementById('update-trace-id').value = trace_id;
+            document.getElementById('update-display-trace-id').value = trace_id;
+            document.getElementById('update-reason').value = '';
+            document.getElementById('update-modal').style.display = 'flex';
+        }
+
+        function openHardDeleteModal(trace_id) {
+            document.getElementById('hard-delete-trace-id').value = trace_id;
+            document.getElementById('hard-delete-display-trace-id').value = trace_id;
+            document.getElementById('hard-delete-secret').value = '';
+            document.getElementById('hard-delete-reason').value = '';
+            document.getElementById('hard-delete-modal').style.display = 'flex';
+        }
+
+        function closeModal(id) {
+            document.getElementById(id).style.display = 'none';
+        }
+
+        async function submitUpdate(event) {
+            event.preventDefault();
+            const trace_id = document.getElementById('update-trace-id').value;
+            const operator = document.getElementById('update-operator').value;
+            const target_temp = parseFloat(document.getElementById('update-target-temp').value);
+            const temp_list = document.getElementById('update-temp-log').value
+                .split(',')
+                .map(n => parseFloat(n.trim()))
+                .filter(n => !isNaN(n));
+            const reason = document.getElementById('update-reason').value;
+
+            const details = {
+                operator,
+                target_temperature_c: target_temp,
+                actual_temperature_log_c: temp_list,
+                remarks: "修正処理工程の完了。"
+            };
+
+            try {
+                const response = await fetch('/api/update', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ trace_id, details, operator, reason })
+                });
+
+                const data = await response.json();
+                if (response.ok) {
+                    showNotification(`データ修正要求を送信しました。(version ${data.version}) 合意形成を実行してください。`, 'success');
+                    closeModal('update-modal');
+                    fetchState();
+                } else {
+                    showNotification(`修正エラー: ${data.error}`, 'error');
+                }
+            } catch (err) {
+                showNotification('接続エラーが発生しました。', 'error');
+            }
+        }
+
+        async function softDeleteRecord(trace_id) {
+            const reason = prompt('論理削除の理由を入力してください:');
+            if (reason === null) return; 
+            if (!reason.trim()) {
+                showNotification('理由は必須です。', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/soft-delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ trace_id, reason, operator: 'operator_user' })
+                });
+
+                const data = await response.json();
+                if (response.ok) {
+                    showNotification('論理削除要求を送信しました。合意形成を実行してください。', 'success');
+                    fetchState();
+                } else {
+                    showNotification(`論理削除エラー: ${data.error}`, 'error');
+                }
+            } catch (err) {
+                showNotification('接続エラーが発生しました。', 'error');
+            }
+        }
+
+        async function submitHardDelete(event) {
+            event.preventDefault();
+            const trace_id = document.getElementById('hard-delete-trace-id').value;
+            const operator = document.getElementById('hard-delete-operator').value;
+            const reason = document.getElementById('hard-delete-reason').value;
+            const admin_secret = document.getElementById('hard-delete-secret').value;
+
+            try {
+                const response = await fetch('/api/hard-delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ trace_id, operator, reason, admin_secret })
+                });
+
+                const data = await response.json();
+                if (response.ok) {
+                    showNotification(`物理削除を実行しました。対象の ${data.deleted_versions} 個のバージョンを消去しました。(監査ログID: ${data.audit_log_id})`, 'success');
+                    closeModal('hard-delete-modal');
+                    fetchState();
+                } else {
+                    showNotification(`物理削除エラー: ${data.error}`, 'error');
+                }
+            } catch (err) {
+                showNotification('接続エラーが発生しました。', 'error');
+            }
+        }
+
         async function resetState() {
             if (!confirm('システムの状態を初期化（すべてのブロックチェーンとDBデータを消去）しますか？')) return;
             
             try {
                 const response = await fetch('/api/reset', { method: 'POST' });
                 if (response.ok) {
-                    // Reset local status caches
                     for (let key in auditStatuses) delete auditStatuses[key];
                     showNotification('システムを初期化しました。', 'success');
                     fetchState();
@@ -1079,5 +1299,79 @@
         fetchState();
         setInterval(fetchState, 1500);
     </script>
+
+    <!-- Update Modal -->
+    <div id="update-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.75); z-index:1001; justify-content:center; align-items:center;">
+        <div class="panel" style="width: 500px; max-width: 90%; background: var(--bg-color); border: 1px solid var(--primary); margin-bottom: 0;">
+            <div class="panel-title">
+                <span>データの修正 (UPDATE)</span>
+                <button class="btn btn-secondary btn-sm" style="padding: 4px 8px;" onclick="closeModal('update-modal')">✕</button>
+            </div>
+            <form onsubmit="submitUpdate(event)">
+                <input type="hidden" id="update-trace-id">
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label>trace_id</label>
+                    <input type="text" class="form-input" id="update-display-trace-id" readonly>
+                </div>
+                <div class="form-row" style="margin-bottom:12px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                    <div class="form-group">
+                        <label>担当オペレーター</label>
+                        <input type="text" class="form-input" id="update-operator" value="山田 太郎" required>
+                    </div>
+                    <div class="form-group">
+                        <label>設定目標温度 (℃)</label>
+                        <input type="number" step="0.1" class="form-input" id="update-target-temp" value="75.0" required>
+                    </div>
+                </div>
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label>実測温度ログ (コンマ区切り)</label>
+                    <input type="text" class="form-input" id="update-temp-log" placeholder="74.5, 75.0" required>
+                </div>
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label>修正理由 (Reason) <span style="color:var(--danger)">*</span></label>
+                    <input type="text" class="form-input" id="update-reason" placeholder="入力ミスの修正" required>
+                </div>
+                <div style="display:flex; gap:12px; justify-content:flex-end; margin-top:20px;">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('update-modal')">キャンセル</button>
+                    <button type="submit" class="btn btn-primary">修正の送信</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Hard Delete Modal -->
+    <div id="hard-delete-modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.75); z-index:1001; justify-content:center; align-items:center;">
+        <div class="panel" style="width: 500px; max-width: 90%; background: var(--bg-color); border: 1px solid var(--danger); margin-bottom: 0;">
+            <div class="panel-title">
+                <span style="color: var(--danger)">⚠️ 物理削除 (Hard Delete) - 特権操作</span>
+                <button class="btn btn-secondary btn-sm" style="padding: 4px 8px;" onclick="closeModal('hard-delete-modal')">✕</button>
+            </div>
+            <form onsubmit="submitHardDelete(event)">
+                <input type="hidden" id="hard-delete-trace-id">
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label>trace_id</label>
+                    <input type="text" class="form-input" id="hard-delete-display-trace-id" readonly>
+                </div>
+                <div class="form-group" style="margin-bottom:12px;">
+                    <label>管理者シークレット (X-Admin-Secret) <span style="color:var(--danger)">*</span></label>
+                    <input type="password" class="form-input" id="hard-delete-secret" required>
+                </div>
+                <div class="form-row" style="margin-bottom:12px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+                    <div class="form-group">
+                        <label>実行者</label>
+                        <input type="text" class="form-input" id="hard-delete-operator" value="admin" required>
+                    </div>
+                    <div class="form-group">
+                        <label>削除理由 <span style="color:var(--danger)">*</span></label>
+                        <input type="text" class="form-input" id="hard-delete-reason" placeholder="GDPR 削除請求への対応" required>
+                    </div>
+                </div>
+                <div style="display:flex; gap:12px; justify-content:flex-end; margin-top:20px;">
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('hard-delete-modal')">キャンセル</button>
+                    <button type="submit" class="btn btn-primary btn-danger">物理削除の実行 (不可逆)</button>
+                </div>
+            </form>
+        </div>
+    </div>
 </body>
 </html>

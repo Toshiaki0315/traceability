@@ -16,7 +16,7 @@
 import os
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 
 from traceability import (
@@ -28,6 +28,7 @@ from traceability import (
     default_weight_check_rule,
     dict_to_block,
     encode_payload,
+    sign_data,
 )
 
 
@@ -57,6 +58,29 @@ class AuditRequest(BaseModel):
     record_id: str
 
 
+class CreateTraceRequest(BaseModel):
+    trace_id: str
+    lot_number: str
+    payload: Dict[str, Any]
+    created_by: Optional[str] = None
+
+
+class UpdateTraceRequest(BaseModel):
+    payload: Dict[str, Any]
+    updated_by: Optional[str] = None
+    reason: str
+
+
+class SoftDeleteRequest(BaseModel):
+    deleted_by: Optional[str] = None
+    reason: str
+
+
+class HardDeleteRequest(BaseModel):
+    executed_by: str
+    reason: str
+
+
 class ProposeResponse(BaseModel):
     block_hash: Optional[str] = None
     status: str
@@ -76,6 +100,8 @@ def create_node_app(
     offchain_store: Optional[OffChainStore] = None,
 ) -> FastAPI:
     """単一ノード用 FastAPI アプリケーションを生成する（テスト・本番共通）"""
+    if offchain_store:
+        node.set_offchain_store(offchain_store)
     app = FastAPI(title=f"Traceability Node API ({node.node_id})")
 
     @app.get("/")
@@ -140,6 +166,225 @@ def create_node_app(
             raise HTTPException(status_code=503, detail="Off-chain store is not configured")
         is_valid = node.audit_offchain_data(req.record_id, offchain_store)
         return {"record_id": req.record_id, "integrity": is_valid}
+
+    @app.post("/api/traceability")
+    def create_traceability(req: CreateTraceRequest):
+        if offchain_store is None:
+            raise HTTPException(status_code=503, detail="Off-chain store is not configured")
+        try:
+            h, salt = offchain_store.save_record(req.trace_id, req.payload, req.created_by)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail={"reason": "validation_error", "message": str(e)})
+
+        # オンチェーン送信用トランザクション作成
+        anchor_data = {
+            "trace_id": req.trace_id,
+            "version": 1,
+            "hash": h,
+            "lot_number": req.lot_number,
+            "created_by": req.created_by or "system"
+        }
+        
+        sig = sign_data(anchor_data, node.private_key)
+        
+        tx_payload = {
+            "data": anchor_data,
+            "signature": sig,
+            "public_key": node.public_key,
+            "type": "OFFCHAIN_ANCHOR"
+        }
+        
+        node.receive_message("NEW_TRANSACTION", tx_payload, node.node_id)
+        node.broadcast("NEW_TRANSACTION", tx_payload)
+        
+        return {
+            "accepted": True,
+            "trace_id": req.trace_id,
+            "version": 1,
+            "tx_status": "PENDING"
+        }
+
+    @app.put("/api/traceability/{trace_id}")
+    def update_traceability(trace_id: str, req: UpdateTraceRequest):
+        if offchain_store is None:
+            raise HTTPException(status_code=503, detail="Off-chain store is not configured")
+        if not req.reason:
+            raise HTTPException(status_code=400, detail={"reason": "validation_error", "message": "reason is required"})
+            
+        # 事前に最新コミット版を取得して情報を得る
+        latest = offchain_store.get_latest_record(trace_id)
+        if not latest:
+            is_deleted = offchain_store.conn.execute("""
+                SELECT COUNT(*) FROM product_traceability
+                WHERE trace_id = ? AND tx_status = 'COMMITTED' AND is_deleted = TRUE
+            """, (trace_id,)).fetchone()[0]
+            if is_deleted > 0:
+                raise HTTPException(status_code=409, detail={"reason": "already_deleted"})
+            else:
+                raise HTTPException(status_code=404, detail={"reason": "trace_not_found"})
+                
+        latest_version = latest["version"]
+        
+        # オンチェーンから lot_number を引き継ぐ
+        lot_number = "unknown"
+        for block in node.chain.chain[1:]:
+            txs = block.data
+            if not isinstance(txs, list):
+                txs = [txs]
+            for tx in txs:
+                if not isinstance(tx, dict):
+                    continue
+                tx_data = tx.get("data", {})
+                if tx_data.get("trace_id") == trace_id and tx_data.get("lot_number"):
+                    lot_number = tx_data.get("lot_number")
+                    break
+
+        try:
+            h, salt = offchain_store.update_record(trace_id, req.payload, req.updated_by, req.reason)
+        except ValueError as e:
+            err_str = str(e)
+            if err_str == "trace_not_found":
+                raise HTTPException(status_code=404, detail={"reason": "trace_not_found"})
+            elif err_str == "already_deleted":
+                raise HTTPException(status_code=409, detail={"reason": "already_deleted"})
+            elif err_str == "pending_transaction_exists":
+                raise HTTPException(status_code=409, detail={"reason": "pending_transaction_exists"})
+            else:
+                raise HTTPException(status_code=400, detail={"reason": "validation_error", "message": err_str})
+
+        # オンチェーン送信用
+        version = latest_version + 1
+        update_data = {
+            "trace_id": trace_id,
+            "version": version,
+            "previous_version": latest_version,
+            "hash": h,
+            "lot_number": lot_number,
+            "updated_by": req.updated_by or "system",
+            "reason": req.reason
+        }
+        
+        sig = sign_data(update_data, node.private_key)
+        
+        tx_payload = {
+            "data": update_data,
+            "signature": sig,
+            "public_key": node.public_key,
+            "type": "OFFCHAIN_UPDATE"
+        }
+        
+        node.receive_message("NEW_TRANSACTION", tx_payload, node.node_id)
+        node.broadcast("NEW_TRANSACTION", tx_payload)
+        
+        return {
+            "accepted": True,
+            "trace_id": trace_id,
+            "version": version,
+            "tx_status": "PENDING"
+        }
+
+    @app.delete("/api/traceability/{trace_id}")
+    def soft_delete_traceability(trace_id: str, req: SoftDeleteRequest):
+        if offchain_store is None:
+            raise HTTPException(status_code=503, detail="Off-chain store is not configured")
+        
+        try:
+            latest_version = offchain_store.validate_soft_delete(trace_id)
+        except ValueError as e:
+            err_str = str(e)
+            if err_str == "trace_not_found":
+                raise HTTPException(status_code=404, detail={"reason": "trace_not_found"})
+            elif err_str == "already_deleted":
+                raise HTTPException(status_code=409, detail={"reason": "already_deleted"})
+            elif err_str == "pending_transaction_exists":
+                raise HTTPException(status_code=409, detail={"reason": "pending_transaction_exists"})
+            else:
+                raise HTTPException(status_code=400, detail={"reason": "validation_error", "message": err_str})
+
+        # オンチェーン送信用
+        delete_data = {
+            "trace_id": trace_id,
+            "target_version": latest_version,
+            "deleted_by": req.deleted_by or "system",
+            "reason": req.reason
+        }
+        
+        sig = sign_data(delete_data, node.private_key)
+        
+        tx_payload = {
+            "data": delete_data,
+            "signature": sig,
+            "public_key": node.public_key,
+            "type": "OFFCHAIN_SOFT_DELETE"
+        }
+        
+        node.receive_message("NEW_TRANSACTION", tx_payload, node.node_id)
+        node.broadcast("NEW_TRANSACTION", tx_payload)
+        
+        return {
+            "accepted": True,
+            "trace_id": trace_id,
+            "target_version": latest_version,
+            "status": "soft_delete_pending"
+        }
+
+    @app.delete("/api/admin/traceability/{trace_id}/hard")
+    def hard_delete_traceability(
+        trace_id: str,
+        req: HardDeleteRequest,
+        x_admin_secret: Optional[str] = Header(None, alias="X-Admin-Secret")
+    ):
+        if offchain_store is None:
+            raise HTTPException(status_code=503, detail="Off-chain store is not configured")
+            
+        expected_secret = os.getenv("ADMIN_SECRET", "change_me_to_strong_random_value")
+        if x_admin_secret != expected_secret:
+            raise HTTPException(status_code=403, detail={"reason": "forbidden"})
+            
+        # オンチェーンの該当ハッシュを収集する
+        anchored_hashes = []
+        for block in node.chain.chain[1:]:
+            txs = block.data
+            if not isinstance(txs, list):
+                txs = [txs]
+            for tx in txs:
+                if not isinstance(tx, dict):
+                    continue
+                tx_data = tx.get("data", {})
+                if tx_data.get("trace_id") == trace_id:
+                    h = tx_data.get("hash")
+                    if h:
+                        anchored_hashes.append(h)
+                        
+        try:
+            audit_log_id, deleted_versions = offchain_store.hard_delete(
+                trace_id,
+                executed_by=req.executed_by,
+                reason=req.reason,
+                anchored_hashes=anchored_hashes
+            )
+        except ValueError as e:
+            if str(e) == "trace_not_found":
+                raise HTTPException(status_code=404, detail={"reason": "trace_not_found"})
+            raise HTTPException(status_code=400, detail={"reason": "validation_error", "message": str(e)})
+            
+        return {
+            "deleted": True,
+            "trace_id": trace_id,
+            "deleted_versions": deleted_versions,
+            "audit_log_id": audit_log_id
+        }
+
+    @app.get("/api/audit/{trace_id}")
+    def audit_traceability(trace_id: str):
+        if offchain_store is None:
+            raise HTTPException(status_code=503, detail="Off-chain store is not configured")
+            
+        audit_res = node.audit_trace_data(trace_id, offchain_store)
+        if not audit_res.get("valid") and audit_res.get("reason") == "trace_not_found":
+            raise HTTPException(status_code=404, detail={"reason": "trace_not_found"})
+            
+        return audit_res
 
     @app.post("/pbft/{route}")
     def handle_pbft(route: str, message: PBFTMessage):

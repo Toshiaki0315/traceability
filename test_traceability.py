@@ -474,7 +474,7 @@ class TestOffChainOnChainIntegration(unittest.TestCase):
         lot_number = "LOT-100"
         details = {"temperature": 72.3, "duration_sec": 1800, "operator": "Alice"}
         
-        record_hash = self.offchain_store.save_record(
+        record_hash = self.offchain_store.save_legacy_record(
             record_id=record_id,
             lot_number=lot_number,
             process_name="加熱処理",
@@ -526,7 +526,7 @@ class TestOffChainOnChainIntegration(unittest.TestCase):
         lot_number = "LOT-200"
         details = {"pH": 6.8, "humidity": 45}
         
-        record_hash = self.offchain_store.save_record(record_id, lot_number, "発酵工程", details)
+        record_hash = self.offchain_store.save_legacy_record(record_id, lot_number, "発酵工程", details)
         
         # アンカリング
         anchor_data = {"record_id": record_id, "hash": record_hash, "lot_number": lot_number}
@@ -553,7 +553,7 @@ class TestOffChainOnChainIntegration(unittest.TestCase):
         lot_number = "LOT-300"
         details = {"weight_g": 950}
         
-        record_hash = self.offchain_store.save_record(record_id, lot_number, "包装工程", details)
+        record_hash = self.offchain_store.save_legacy_record(record_id, lot_number, "包装工程", details)
         
         # アンカリング
         anchor_data = {"record_id": record_id, "hash": record_hash, "lot_number": lot_number}
@@ -788,7 +788,7 @@ class TestNodeWebAPI(unittest.TestCase):
         from traceability import sign_data, encode_payload
 
         record_id = "rec-http-audit"
-        offchain_hash = self.offchain.save_record(
+        offchain_hash = self.offchain.save_legacy_record(
             record_id, "LOT-AUDIT", "加熱", {"temp": 70.0}
         )
         leader = self.nodes[1]
@@ -884,6 +884,298 @@ class TestBulkTransactionProcessing(unittest.TestCase):
         latest_block = self.leader.chain.get_latest_block()
         self.assertEqual(len(latest_block.data), 1)
         self.assertEqual(len(self.leader.pending_transactions), 0)
+
+class TestNewSpecDataManagement(unittest.TestCase):
+    """ステップ12: データ管理・修正・削除機能（追加仕様書 V2.3 Final に基づく実装）のテスト"""
+
+    def setUp(self):
+        from traceability import Node, OffChainStore
+        self.offchain_store = OffChainStore(db_path=":memory:")
+        self.node_leader = Node("Node1(Leader)", "Leader")
+        self.node_replica = Node("Node2(Replica)", "Replica")
+        
+        self.node_leader.add_peer(self.node_replica)
+        self.node_replica.add_peer(self.node_leader)
+        
+        self.node_leader.set_offchain_store(self.offchain_store)
+        self.node_replica.set_offchain_store(self.offchain_store)
+
+    def tearDown(self):
+        self.offchain_store.close()
+
+    def test_create_flow(self):
+        """CREATE: 新規作成、PENDING状態、および合意成功後の COMMITTED 状態への遷移"""
+        trace_id = "TRACE-T-001"
+        lot_number = "LOT-T-100"
+        payload = {"operator": "UserA", "temperature": 75.0}
+        
+        h, salt = self.offchain_store.save_record(trace_id, payload, created_by="UserA")
+        
+        # 1. 初期状態検証
+        self.assertEqual(len(salt), 64) # 32 byte hex = 64 chars
+        
+        # DB状態
+        res = self.offchain_store.conn.execute(
+            "SELECT version, tx_status, is_deleted FROM product_traceability WHERE trace_id = ?",
+            (trace_id,)
+        ).fetchone()
+        self.assertIsNotNone(res)
+        self.assertEqual(res[0], 1)
+        self.assertEqual(res[1], "PENDING")
+        self.assertFalse(res[2])
+        
+        # 最新版取得（PENDINGなので取得できないはず）
+        latest = self.offchain_store.get_latest_record(trace_id)
+        self.assertIsNone(latest)
+        
+        # オンチェーンアンカー
+        anchor_data = {
+            "trace_id": trace_id,
+            "version": 1,
+            "hash": h,
+            "lot_number": lot_number,
+            "created_by": "UserA"
+        }
+        
+        from traceability import sign_data
+        tx_payload = {
+            "data": anchor_data,
+            "signature": sign_data(anchor_data, self.node_leader.private_key),
+            "public_key": self.node_leader.public_key,
+            "type": "OFFCHAIN_ANCHOR"
+        }
+        
+        self.node_leader.receive_message("NEW_TRANSACTION", tx_payload, "Sender")
+        self.node_replica.receive_message("NEW_TRANSACTION", tx_payload, "Sender")
+        
+        # 合意
+        self.node_leader.propose_block()
+        
+        # 合意後
+        res_after = self.offchain_store.conn.execute(
+            "SELECT tx_status FROM product_traceability WHERE trace_id = ?",
+            (trace_id,)
+        ).fetchone()
+        self.assertEqual(res_after[0], "COMMITTED")
+        
+        # 最新版取得
+        latest = self.offchain_store.get_latest_record(trace_id)
+        self.assertIsNotNone(latest)
+        self.assertEqual(latest["version"], 1)
+        self.assertEqual(latest["payload"]["operator"], "UserA")
+        
+        # 監査
+        audit_res = self.node_leader.audit_trace_data(trace_id, self.offchain_store)
+        self.assertTrue(audit_res["valid"])
+        self.assertEqual(audit_res["status"], "active")
+
+    def test_update_flow(self):
+        """UPDATE: データ修正、新versionの追加、およびSoft Delete済みに対するUPDATEの拒否"""
+        trace_id = "TRACE-T-002"
+        lot_number = "LOT-T-200"
+        
+        # 1. 最初期 COMMITTED を作成
+        h1, salt1 = self.offchain_store.save_record(trace_id, {"val": 10}, "UserA")
+        # 疑似 finalize (COMMITTED)
+        self.offchain_store.conn.execute(
+            "UPDATE product_traceability SET tx_status = 'COMMITTED' WHERE trace_id = ? AND version = 1",
+            (trace_id,)
+        )
+        
+        # 2. UPDATE の実行
+        h2, salt2 = self.offchain_store.update_record(trace_id, {"val": 20}, "UserB", "修正")
+        
+        # PENDING で version 2 が作成されていること
+        res_v2 = self.offchain_store.conn.execute(
+            "SELECT version, tx_status FROM product_traceability WHERE trace_id = ? ORDER BY version DESC",
+            (trace_id,)
+        ).fetchall()
+        self.assertEqual(len(res_v2), 2)
+        self.assertEqual(res_v2[0][0], 2)
+        self.assertEqual(res_v2[0][1], "PENDING")
+        self.assertEqual(res_v2[1][0], 1)
+        self.assertEqual(res_v2[1][1], "COMMITTED")
+        
+        # PENDING が存在するため UPDATE が拒否されること
+        with self.assertRaises(ValueError) as ctx:
+            self.offchain_store.update_record(trace_id, {"val": 30}, "UserB", "再修正")
+        self.assertEqual(str(ctx.exception), "pending_transaction_exists")
+        
+        # 疑似 finalize version 2
+        self.offchain_store.conn.execute(
+            "UPDATE product_traceability SET tx_status = 'COMMITTED' WHERE trace_id = ? AND version = 2",
+            (trace_id,)
+        )
+        
+        # 最新版取得で version 2 が返ること
+        latest = self.offchain_store.get_latest_record(trace_id)
+        self.assertEqual(latest["version"], 2)
+        self.assertEqual(latest["payload"]["val"], 20)
+
+    def test_soft_delete_flow(self):
+        """SOFT_DELETE: 論理削除、過去バージョンの浮上防止、および監査の動作"""
+        trace_id = "TRACE-T-003"
+        
+        # 1. 準備 (COMMITTED の version 1, 2)
+        self.offchain_store.save_record(trace_id, {"val": 10}, "UserA")
+        self.offchain_store.conn.execute("UPDATE product_traceability SET tx_status = 'COMMITTED'")
+        self.offchain_store.update_record(trace_id, {"val": 20}, "UserA", "修正")
+        self.offchain_store.conn.execute("UPDATE product_traceability SET tx_status = 'COMMITTED' WHERE version = 2")
+        
+        # 2. validate_soft_delete
+        v = self.offchain_store.validate_soft_delete(trace_id)
+        self.assertEqual(v, 2)
+        
+        # 3. Soft Delete トランザクション
+        delete_data = {
+            "trace_id": trace_id,
+            "target_version": 2,
+            "deleted_by": "UserDel",
+            "reason": "ロット取消"
+        }
+        from traceability import sign_data
+        tx_payload = {
+            "data": delete_data,
+            "signature": sign_data(delete_data, self.node_leader.private_key),
+            "public_key": self.node_leader.public_key,
+            "type": "OFFCHAIN_SOFT_DELETE"
+        }
+        
+        # 合意前は is_deleted が変更されない
+        self.node_leader.receive_message("NEW_TRANSACTION", tx_payload, "Sender")
+        self.node_replica.receive_message("NEW_TRANSACTION", tx_payload, "Sender")
+        
+        res_before = self.offchain_store.conn.execute(
+            "SELECT is_deleted FROM product_traceability WHERE trace_id = ?",
+            (trace_id,)
+        ).fetchall()
+        self.assertTrue(all(r[0] is False for r in res_before))
+        
+        # 合意
+        self.node_leader.propose_block()
+        
+        # 合意後はすべての version が is_deleted = TRUE になる
+        res_after = self.offchain_store.conn.execute(
+            "SELECT is_deleted FROM product_traceability WHERE trace_id = ?",
+            (trace_id,)
+        ).fetchall()
+        self.assertTrue(all(r[0] is True for r in res_after))
+        
+        # 最新版取得が None になること（過去versionの再浮上防止）
+        latest = self.offchain_store.get_latest_record(trace_id)
+        self.assertIsNone(latest)
+        
+        # UPDATE が拒否されること
+        with self.assertRaises(ValueError) as ctx:
+            self.offchain_store.update_record(trace_id, {"val": 30}, "UserA", "削除後修正")
+        self.assertEqual(str(ctx.exception), "already_deleted")
+        
+        # 監査
+        audit_res = self.node_leader.audit_trace_data(trace_id, self.offchain_store)
+        self.assertTrue(audit_res["valid"])
+        self.assertEqual(audit_res["status"], "soft_deleted")
+        self.assertEqual(audit_res["target_version"], 2)
+
+    def test_hard_delete_flow(self):
+        """HARD_DELETE: 物理削除の実行、ログ出力、個人情報の排除、および監査の動作"""
+        trace_id = "TRACE-T-004"
+        import tempfile
+        import os
+        from traceability import sign_data
+        
+        # 一時ログファイル準備
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_log:
+            tmp_log_path = tmp_log.name
+            
+        try:
+            # 準備
+            h, salt = self.offchain_store.save_record(trace_id, {"secret_p": "confidential_val"}, "UserA")
+            self.offchain_store.conn.execute("UPDATE product_traceability SET tx_status = 'COMMITTED'")
+            
+            # オンチェーン擬似データ
+            self.node_leader.chain.add_process_data(
+                "OFFCHAIN_ANCHOR",
+                {"trace_id": trace_id, "version": 1, "hash": h, "lot_number": "L"},
+                self.node_leader.public_key,
+                sign_data({"trace_id": trace_id, "version": 1, "hash": h, "lot_number": "L"}, self.node_leader.private_key)
+            )
+            
+            # 物理削除
+            audit_log_id, deleted_versions = self.offchain_store.hard_delete(
+                trace_id=trace_id,
+                executed_by="admin",
+                reason="GDPR",
+                anchored_hashes=[h],
+                log_path=tmp_log_path
+            )
+            
+            self.assertEqual(deleted_versions, 1)
+            self.assertTrue(audit_log_id.startswith("hd-"))
+            
+            # DBから物理的に消去されていること
+            res = self.offchain_store.conn.execute(
+                "SELECT COUNT(*) FROM product_traceability WHERE trace_id = ?",
+                (trace_id,)
+            ).fetchone()[0]
+            self.assertEqual(res, 0)
+            
+            # ログの検証
+            with open(tmp_log_path, "r", encoding="utf-8") as f:
+                log_lines = f.readlines()
+            self.assertEqual(len(log_lines), 1)
+            log_data = json.loads(log_lines[0])
+            self.assertEqual(log_data["audit_log_id"], audit_log_id)
+            self.assertEqual(log_data["trace_id"], trace_id)
+            self.assertNotIn("payload", log_data)
+            self.assertNotIn("salt", log_data)
+            self.assertNotIn("confidential_val", log_lines[0])
+            
+            # 監査
+            audit_res = self.node_leader.audit_trace_data(trace_id, self.offchain_store)
+            self.assertTrue(audit_res["valid"])
+            self.assertEqual(audit_res["status"], "hard_deleted")
+            
+        finally:
+            if os.path.exists(tmp_log_path):
+                os.remove(tmp_log_path)
+
+    def test_pending_ttl(self):
+        """TTL: PENDING レコードの有効期限（TTL）タイムアウトによる FAILED への遷移"""
+        import os
+        import time
+        os.environ["PBFT_PENDING_TTL_SECONDS"] = "1"
+        
+        try:
+            trace_id = "TRACE-T-005"
+            h, salt = self.offchain_store.save_record(trace_id, {"val": 10}, "UserA")
+            
+            res = self.offchain_store.conn.execute(
+                "SELECT tx_status FROM product_traceability WHERE trace_id = ?",
+                (trace_id,)
+            ).fetchone()
+            self.assertEqual(res[0], "PENDING")
+            
+            from datetime import datetime, timedelta, timezone
+            time.sleep(1.5)
+            
+            cutoff = datetime.now(timezone.utc)
+            self.offchain_store.conn.execute("""
+                UPDATE product_traceability
+                SET tx_status = 'FAILED',
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE tx_status = 'PENDING'
+                  AND created_at < ?
+            """, (cutoff,))
+            
+            res_after = self.offchain_store.conn.execute(
+                "SELECT tx_status FROM product_traceability WHERE trace_id = ?",
+                (trace_id,)
+            ).fetchone()
+            self.assertEqual(res_after[0], "FAILED")
+            
+        finally:
+            del os.environ["PBFT_PENDING_TTL_SECONDS"]
+
 
 if __name__ == '__main__':
     unittest.main()

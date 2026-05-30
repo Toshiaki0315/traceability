@@ -50,6 +50,36 @@
   - `BULK_MAX_WAIT_SECONDS`: トランザクションがプールに入ってから設定時間（デフォルト5秒）が経過した際に、件数が閾値未満であってもブロック化。
 - **バックグラウンド監視**: リーダーノードに常駐する監視スレッド（`_batch_watcher`）がスレッドセーフにバルク条件の判定を行い、自動的にブロック提案（PRE_PREPARE）をトリガーします。
 
+### ステップ12: データ管理・修正・削除機能（追加仕様書 V2.3）
+オフチェーンDBに `product_traceability` テーブルを追加し、CREATE / UPDATE / Soft Delete / Hard Delete を PBFT 合意と連動させます。
+
+- **新テーブル `product_traceability`**: `trace_id` + `version` で履歴管理。`tx_status`（PENDING → COMMITTED / FAILED）と `is_deleted`（論理削除）を保持。
+- **レガシー互換**: 旧 `manufacturing_details` テーブルは読み取り専用として残置（`save_legacy_record()`）。
+- **ハッシュ計算**: `secrets.token_hex(32)` による Salt + JSON 正規化 SHA-256（`calculate_hash()`）。
+- **PBFT 連動**: 合意確定時（`_try_finalize`）に PENDING → COMMITTED、Soft Delete 時に `is_deleted = TRUE` へ冪等更新。
+- **TTL 監視**: PENDING レコードが `PBFT_PENDING_TTL_SECONDS`（既定30秒）を超えた場合、バックグラウンドで FAILED へ遷移。
+- **Hard Delete**: オンチェーン非発行・全 version 物理削除。`data/hard_delete.log` に監査ログ（payload/salt は出力禁止）。
+
+#### 主な API（Flask Web UI / FastAPI ノード）
+
+| メソッド | パス | 説明 |
+|---|---|---|
+| `POST` | `/api/traceability` | 新規登録（CREATE、PENDING で保存） |
+| `PUT` | `/api/traceability/{trace_id}` | 修正（UPDATE、新 version を PENDING で INSERT） |
+| `DELETE` | `/api/traceability/{trace_id}` | 論理削除（Soft Delete、PBFT 合意後に反映） |
+| `DELETE` | `/api/admin/traceability/{trace_id}/hard` | 物理削除（`X-Admin-Secret` ヘッダー必須） |
+| `GET` | `/api/audit/{trace_id}` | 監査（active / soft_deleted / hard_deleted / tampered） |
+
+```bash
+# 新規登録（FastAPI ノード例）
+curl -X POST http://127.0.0.1:5002/api/traceability \
+  -H "Content-Type: application/json" \
+  -d '{"trace_id":"LOT-001","lot_number":"L-100","payload":{"temperature":72.5},"created_by":"factory"}'
+
+# 監査
+curl http://127.0.0.1:5002/api/audit/LOT-001
+```
+
 ```
   リーダー           レプリカA          レプリカB
      │                  │                  │
@@ -195,5 +225,5 @@ python -m unittest test_traceability.py
 | `scripts/start_nodes.sh` | 3ノード API サーバー一括起動スクリプト |
 | `app.py` | Flask Web サーバー（REST API + ダッシュボード配信） |
 | `templates/index.html` | Web UI ダッシュボード（HTML/CSS/JS シングルページアプリ） |
-| `test_traceability.py` | ユニットテスト（署名検証, ネットワーク通信, トランザクション分離, PBFT合意形成, Flask API統合テスト） |
+| `test_traceability.py` | ユニットテスト（署名検証〜ステップ12のデータ管理・監査テスト） |
 | `README.md` | 本ドキュメント |
